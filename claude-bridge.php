@@ -3,16 +3,16 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://github.com/adelsherif8/claude-bridge
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, GitHub auto-updates.
- * Version:      1.1.1
+ * Version:      1.1.2
  * Author:       Adel Emad
- * Author URI:   https://github.com/adelsherif8
+ * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
  * Update URI:   false
  */
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.1.1' );
+define( 'CB_VERSION', '1.1.2' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -22,6 +22,7 @@ class Claude_Bridge {
 	const OPT_MODE  = 'claude_bridge_auth_mode';    // 'token_only' | 'token_and_apppass'
 	const OPT_REPO  = 'claude_bridge_github_repo';  // 'username/repo-name'
 
+	const DEFAULT_REPO = 'adelsherif8/claude-bridge'; // auto-updates work out of the box
 	/* ─── bootstrap ─── */
 
 	public static function init() {
@@ -229,8 +230,8 @@ class Claude_Bridge {
 	/* ─── GitHub auto-updater ─── */
 
 	private static function github_release() {
-		$repo = get_option( self::OPT_REPO );
-		if ( ! $repo ) { return null; }
+		$repo = trim( (string) get_option( self::OPT_REPO ) );
+		if ( '' === $repo ) { $repo = self::DEFAULT_REPO; }
 		$cached = get_transient( 'cb_github_release' );
 		if ( $cached !== false ) { return $cached ?: null; }
 		$resp = wp_remote_get( "https://api.github.com/repos/{$repo}/releases/latest", [
@@ -274,7 +275,7 @@ class Claude_Bridge {
 			'name'          => 'Claude Bridge',
 			'slug'          => dirname( plugin_basename( CB_FILE ) ),
 			'version'       => ltrim( $release['tag_name'], 'v' ),
-			'author'        => '<a href="https://github.com/adelsherif8">Adel Emad</a>',
+			'author'        => '<a href="https://adelatya.com">Adel Emad</a>',
 			'homepage'      => $release['html_url'],
 			'download_link' => $release['zipball_url'],
 			'sections'      => [ 'description' => nl2br( esc_html( $release['body'] ?? 'REST API bridge for Claude Code.' ) ) ],
@@ -311,7 +312,8 @@ class Claude_Bridge {
 		$base    = rest_url( CB_NS );
 		$token   = self::token();
 		$mode    = get_option( self::OPT_MODE, 'token_only' );
-		$repo    = get_option( self::OPT_REPO, '' );
+		$repo    = trim( (string) get_option( self::OPT_REPO ) );
+		if ( '' === $repo ) { $repo = self::DEFAULT_REPO; }
 		$release = self::github_release();
 		$latest  = $release ? ltrim( $release['tag_name'], 'v' ) : null;
 		$has_upd = $latest && version_compare( $latest, CB_VERSION, '>' );
@@ -354,8 +356,8 @@ class Claude_Bridge {
 			<td>
 				<input type="text" name="<?php echo esc_attr( self::OPT_REPO ); ?>" value="<?php echo esc_attr( $repo ); ?>" placeholder="username/claude-bridge" style="width:320px">
 				<p class="description">
-					For auto-updates from GitHub — format: <code>username/claude-bridge</code>.<br>
-					Leave empty to disable. Requires GitHub releases tagged as <code>v1.x.x</code> with the plugin ZIP attached.
+					Auto-updates are on by default from <code>adelsherif8/claude-bridge</code>.<br>
+					Only change this to track a different fork — format: <code>username/repo</code>.
 					<?php if ( $latest ) { echo '<br>Installed: v' . CB_VERSION . ' &nbsp;·&nbsp; GitHub latest: v' . esc_html( $latest ); } ?>
 				</p>
 			</td>
