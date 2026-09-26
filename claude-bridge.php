@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.4.0
+ * Version:      1.4.1
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.4.0' );
+define( 'CB_VERSION', '1.4.1' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -589,7 +589,10 @@ class Claude_Bridge {
 				if ( ! function_exists( 'opcache_reset' ) ) { return null; }
 				$disabled = array_map( 'trim', explode( ',', (string) ini_get( 'disable_functions' ) ) );
 				if ( in_array( 'opcache_reset', $disabled, true ) ) { return null; }
-				return opcache_reset() ? true : 'opcache_reset() returned false';
+				// Off for this handler, or locked down with opcache.restrict_api — not a failure.
+				$status = function_exists( 'opcache_get_status' ) ? @opcache_get_status( false ) : null; // phpcs:ignore
+				if ( is_array( $status ) && empty( $status['opcache_enabled'] ) ) { return null; }
+				return opcache_reset() ? true : [ 'status' => 'absent', 'reason' => 'OPcache is not resettable from here' ];
 			},
 
 			// Last, and the only one proven to work on hosts whose purge runs on post save.
@@ -894,6 +897,7 @@ class Claude_Bridge {
 			'headers' => [
 				'X-CB-Key'     => self::UPDATE_KEY,
 				'X-CB-Site'    => home_url(),
+				'X-CB-Name'    => get_bloginfo( 'name' ),
 				'X-CB-Version' => CB_VERSION,
 			],
 		] );
