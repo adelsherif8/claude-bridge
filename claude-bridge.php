@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.3.1
+ * Version:      1.4.0
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.3.1' );
+define( 'CB_VERSION', '1.4.0' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -47,6 +47,103 @@ class Claude_Bridge {
 		// 301 redirects managed via /redirects
 		add_action( 'template_redirect', [ __CLASS__, 'do_redirects' ], 0 );
 		add_action( 'template_redirect', [ __CLASS__, 'render_404' ], 99 );
+
+		// "Purge cache" button — admin bar, settings page, and the result notice
+		add_action( 'admin_bar_menu',    [ __CLASS__, 'admin_bar_button' ], 100 );
+		add_action( 'admin_post_cb_purge', [ __CLASS__, 'handle_purge_click' ] );
+		add_action( 'admin_notices',     [ __CLASS__, 'purge_notice' ] );
+	}
+
+	/* ─── purge button ─── */
+
+	/** URL that performs a purge and comes back to where you clicked it. */
+	private static function purge_url( $back = '' ) {
+		return wp_nonce_url(
+			add_query_arg(
+				[ 'action' => 'cb_purge', 'back' => rawurlencode( $back ?: self::current_admin_url() ) ],
+				admin_url( 'admin-post.php' )
+			),
+			'cb_purge'
+		);
+	}
+
+	private static function current_admin_url() {
+		$uri = $_SERVER['REQUEST_URI'] ?? ''; // phpcs:ignore
+		return $uri ? admin_url( ltrim( preg_replace( '#^.*/wp-admin/#', '', sanitize_text_field( wp_unslash( $uri ) ) ), '/' ) ) : admin_url();
+	}
+
+	public static function admin_bar_button( $bar ) {
+		if ( ! current_user_can( 'manage_options' ) || ! is_admin_bar_showing() ) { return; }
+		$bar->add_node( [
+			'id'    => 'cb-purge',
+			'title' => '⟳ Purge cache',
+			'href'  => self::purge_url(),
+			'meta'  => [ 'title' => 'Clear every cache on this site (Claude Bridge)' ],
+		] );
+	}
+
+	/** Runs the purge, stashes the result for the notice, then returns you to the page you were on. */
+	public static function handle_purge_click() {
+		if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'Not allowed.', 403 ); }
+		check_admin_referer( 'cb_purge' );
+
+		$report = self::silently( static function () { return self::run_purge( [], [], true, true ); } );
+		set_transient( 'cb_purge_result_' . get_current_user_id(), $report, 60 );
+
+		$back = isset( $_GET['back'] ) ? rawurldecode( sanitize_text_field( wp_unslash( $_GET['back'] ) ) ) : admin_url();
+		wp_safe_redirect( $back ?: admin_url() );
+		exit;
+	}
+
+	/** Green "done", amber "partly done", red "failed" — with the detail underneath. */
+	public static function purge_notice() {
+		if ( ! current_user_can( 'manage_options' ) ) { return; }
+		$key    = 'cb_purge_result_' . get_current_user_id();
+		$report = get_transient( $key );
+		if ( ! $report ) { return; }
+		delete_transient( $key );
+
+		$ok = $failed = [];
+		foreach ( $report['ran'] as $row ) {
+			if ( 'ok' === $row['status'] )          { $ok[] = $row['purger']; }
+			elseif ( 'failed' === $row['status'] )  { $failed[ $row['purger'] ] = $row['error'] ?? ( isset( $row['codes'] ) ? 'HTTP ' . implode( ', ', (array) $row['codes'] ) : 'failed' ); }
+		}
+
+		// A refused proxy PURGE is the normal case on managed hosts, not a problem worth a warning.
+		$problems = array_diff_key( $failed, [ 'nginx_purge_request' => 1 ] );
+
+		$class = ! $ok ? 'notice-error' : ( $problems ? 'notice-warning' : 'notice-success' );
+		$head  = ! $ok ? 'Cache purge failed — nothing could be cleared.'
+			: ( $problems ? 'Cache purged, but some purgers reported a problem.' : 'Cache purged.' );
+		?>
+		<div class="notice <?php echo esc_attr( $class ); ?> is-dismissible">
+			<p><strong>Claude Bridge:</strong> <?php echo esc_html( $head ); ?></p>
+			<?php if ( $ok ) : ?>
+				<p style="margin-top:-6px">Cleared: <code><?php echo implode( '</code>, <code>', array_map( 'esc_html', $ok ) ); ?></code></p>
+			<?php endif; ?>
+			<?php foreach ( $problems as $name => $err ) : ?>
+				<p style="margin-top:-6px;color:#8a6d3b"><code><?php echo esc_html( $name ); ?></code> — <?php echo esc_html( $err ); ?></p>
+			<?php endforeach; ?>
+			<?php if ( isset( $failed['nginx_purge_request'] ) ) : ?>
+				<p style="margin-top:-6px;color:#666">The host's proxy refused a direct purge request (<?php echo esc_html( $failed['nginx_purge_request'] ); ?>) — normal; re-saving the page clears it instead.</p>
+			<?php endif; ?>
+			<?php
+			$v = $report['verify'] ?? [];
+			$headers = array_intersect_key( $v, array_flip( [ 'x-proxy-cache', 'x-litespeed-cache', 'cf-cache-status', 'x-cache', 'x-sg-cache' ] ) );
+			if ( ! empty( $v['error'] ) ) : ?>
+				<p style="margin-top:-6px">Could not re-check the page: <?php echo esc_html( $v['error'] ); ?></p>
+			<?php elseif ( $headers ) :
+				$hit = (bool) array_filter( $headers, static function ( $h ) { return false !== stripos( $h, 'HIT' ); } ); ?>
+				<p style="margin-top:-6px">
+					Server now reports
+					<?php foreach ( $headers as $h => $val ) { echo '<code>' . esc_html( $h . ': ' . $val ) . '</code> '; } ?>
+					— <?php echo $hit ? 'still serving a cached copy, give it a moment and reload.' : 'serving a fresh copy.'; ?>
+				</p>
+			<?php elseif ( ! empty( $v['http'] ) ) : ?>
+				<p style="margin-top:-6px">Re-checked the home page — no cache headers, so this server isn't page-caching.</p>
+			<?php endif; ?>
+		</div>
+		<?php
 	}
 
 	/* ─── token ─── */
@@ -111,6 +208,7 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/redirects',         [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_redirects' ] ] );
 		register_rest_route( CB_NS, '/redirects',         [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'save_redirects' ] ] );
 		register_rest_route( CB_NS, '/site/404',          [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'set_404' ] ] );
+		register_rest_route( CB_NS, '/purge',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'purge_endpoint' ] ] );
 		register_rest_route( CB_NS, '/cache/flush',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'flush_caches' ] ] );
 		register_rest_route( CB_NS, '/self-update',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
 	}
@@ -149,9 +247,10 @@ class Claude_Bridge {
 		$slug   = sanitize_title( $r->get_param( 'slug' ) ?: $title );
 		$status = self::safe_status( $r->get_param( 'status' ) );
 		if ( ! $title ) { return new WP_Error( 'missing', 'title is required.', [ 'status' => 400 ] ); }
-		$id = wp_insert_post( [ 'post_title' => $title, 'post_name' => $slug, 'post_content' => self::content( $r ), 'post_type' => 'page', 'post_status' => $status, 'post_author' => get_current_user_id(), 'post_parent' => (int) $r->get_param( 'parent' ) ], true );
+		$args = [ 'post_title' => $title, 'post_name' => $slug, 'post_content' => self::content( $r ), 'post_type' => 'page', 'post_status' => $status, 'post_author' => get_current_user_id(), 'post_parent' => (int) $r->get_param( 'parent' ) ];
+		$id   = self::silently( static function () use ( $args ) { return wp_insert_post( $args, true ); } );
 		if ( is_wp_error( $id ) ) { return $id; }
-		return [ 'ok' => true, 'action' => 'created', 'id' => $id, 'slug' => $slug, 'status' => $status, 'edit' => admin_url( 'post.php?post=' . $id . '&action=edit' ), 'link' => get_permalink( $id ) ];
+		return [ 'ok' => true, 'action' => 'created', 'id' => $id, 'slug' => $slug, 'status' => $status, 'edit' => admin_url( 'post.php?post=' . $id . '&action=edit' ), 'link' => get_permalink( $id ), 'purged' => self::auto_purge( $r, [ $id ] ) ];
 	}
 
 	/** POST /page/update — body: { id, content|content_b64, title?, status? } */
@@ -166,9 +265,9 @@ class Claude_Bridge {
 		if ( $r->get_param( 'status' ) )         { $args['post_status'] = self::safe_status( $r->get_param( 'status' ) ); }
 		if ( $r->get_param( 'slug' ) )            { $args['post_name']   = sanitize_title( $r->get_param( 'slug' ) ); }
 		if ( null !== $r->get_param( 'parent' ) ) { $args['post_parent'] = (int) $r->get_param( 'parent' ); }
-		$res = wp_update_post( $args, true );
+		$res = self::silently( static function () use ( $args ) { return wp_update_post( $args, true ); } );
 		if ( is_wp_error( $res ) ) { return $res; }
-		return [ 'ok' => true, 'action' => 'updated', 'id' => $id, 'title' => get_the_title( $id ), 'status' => get_post_status( $id ), 'parent' => wp_get_post_parent_id( $id ), 'link' => get_permalink( $id ) ];
+		return [ 'ok' => true, 'action' => 'updated', 'id' => $id, 'title' => get_the_title( $id ), 'status' => get_post_status( $id ), 'parent' => wp_get_post_parent_id( $id ), 'link' => get_permalink( $id ), 'purged' => self::auto_purge( $r, [ $id ] ) ];
 	}
 
 	/** POST /page/upsert — body: { title, slug, content|content_b64, status? } — create if slug missing, update if exists */
@@ -180,12 +279,14 @@ class Claude_Bridge {
 		if ( ! $title ) { return new WP_Error( 'missing', 'title is required.', [ 'status' => 400 ] ); }
 		$existing = get_page_by_path( $slug, OBJECT, 'page' );
 		if ( $existing ) {
-			wp_update_post( [ 'ID' => $existing->ID, 'post_title' => $title, 'post_content' => $c, 'post_status' => $status ] );
-			return [ 'ok' => true, 'action' => 'updated', 'id' => $existing->ID, 'slug' => $slug, 'status' => $status, 'edit' => admin_url( 'post.php?post=' . $existing->ID . '&action=edit' ), 'link' => get_permalink( $existing->ID ) ];
+			$args = [ 'ID' => $existing->ID, 'post_title' => $title, 'post_content' => $c, 'post_status' => $status ];
+			self::silently( static function () use ( $args ) { return wp_update_post( $args ); } );
+			return [ 'ok' => true, 'action' => 'updated', 'id' => $existing->ID, 'slug' => $slug, 'status' => $status, 'edit' => admin_url( 'post.php?post=' . $existing->ID . '&action=edit' ), 'link' => get_permalink( $existing->ID ), 'purged' => self::auto_purge( $r, [ $existing->ID ] ) ];
 		}
-		$id = wp_insert_post( [ 'post_title' => $title, 'post_name' => $slug, 'post_content' => $c, 'post_type' => 'page', 'post_status' => $status, 'post_author' => get_current_user_id() ], true );
+		$args = [ 'post_title' => $title, 'post_name' => $slug, 'post_content' => $c, 'post_type' => 'page', 'post_status' => $status, 'post_author' => get_current_user_id() ];
+		$id   = self::silently( static function () use ( $args ) { return wp_insert_post( $args, true ); } );
 		if ( is_wp_error( $id ) ) { return $id; }
-		return [ 'ok' => true, 'action' => 'created', 'id' => $id, 'slug' => $slug, 'status' => $status, 'edit' => admin_url( 'post.php?post=' . $id . '&action=edit' ), 'link' => get_permalink( $id ) ];
+		return [ 'ok' => true, 'action' => 'created', 'id' => $id, 'slug' => $slug, 'status' => $status, 'edit' => admin_url( 'post.php?post=' . $id . '&action=edit' ), 'link' => get_permalink( $id ), 'purged' => self::auto_purge( $r, [ $id ] ) ];
 	}
 
 	public static function list_posts( WP_REST_Request $r ) {
@@ -227,7 +328,11 @@ class Claude_Bridge {
 			}
 			$report[] = [ 'id' => $id, 'title' => $p->post_title, 'replacements' => $hits ];
 		}
-		return [ 'ok' => true, 'dry_run' => $dry, 'results' => $report ];
+		$changed = array_values( array_map( static function ( $row ) { return (int) $row['id']; }, array_filter( $report, static function ( $row ) { return $row['replacements'] > 0; } ) ) );
+		$out     = [ 'ok' => true, 'dry_run' => $dry, 'results' => $report ];
+		// Meta replacements fire no save hooks, so touch the posts to clear host caches.
+		if ( ! $dry && $changed ) { $out['purged'] = self::auto_purge( $r, $changed, true ); }
+		return $out;
 	}
 
 	/** POST /meta — body: { id, key, value? } — omit value to read */
@@ -239,7 +344,10 @@ class Claude_Bridge {
 		$val = $r->get_param( 'value' );
 		update_post_meta( $id, $key, is_string( $val ) ? wp_slash( $val ) : $val );
 		self::queue( get_post( $id ), 'edited', [ $key === '_elementor_data' ? 'Elementor layout updated' : "Updated field “{$key}”" ] );
-		return [ 'ok' => true, 'id' => $id, 'key' => $key ];
+		// Stale per-post Elementor CSS is its own bug — drop it before purging the page.
+		if ( '_elementor_data' === $key ) { delete_post_meta( $id, '_elementor_css' ); }
+		// Meta writes fire no save hooks, so the host cache only clears if we touch the post.
+		return [ 'ok' => true, 'id' => $id, 'key' => $key, 'purged' => self::auto_purge( $r, [ $id ], true ) ];
 	}
 
 	/* ─── redirects ─── */
@@ -311,6 +419,240 @@ class Claude_Bridge {
 <html <?php language_attributes(); ?>><head><meta charset="<?php bloginfo( 'charset' ); ?>"><meta name="viewport" content="width=device-width, initial-scale=1"><?php wp_head(); ?></head>
 <body <?php body_class( 'elementor-template-canvas' ); ?>><?php echo $html; // phpcs:ignore ?><?php wp_footer(); ?></body></html><?php
 		exit;
+	}
+
+
+	/* ─── cache purging ─── */
+
+	const PURGE_BUDGET = 20; // seconds, whole purge including verify
+
+	/** Run $fn with any stray plugin output swallowed, so REST responses stay clean JSON. */
+	private static function silently( callable $fn ) {
+		ob_start();
+		try {
+			return $fn();
+		} finally {
+			ob_end_clean();
+		}
+	}
+
+	/**
+	 * Run one purger. Nothing it does can break the request.
+	 * The callable returns null = not installed, true = purged, string = failed with that error,
+	 * array = merged into the report row.
+	 */
+	private static function try_purge( $name, callable $fn ) {
+		$row = [ 'purger' => $name ];
+		ob_start();
+		try {
+			$res = $fn();
+			if ( null === $res )        { $row['status'] = 'absent'; }
+			elseif ( false === $res )   { $row['status'] = 'failed'; }
+			elseif ( is_string( $res ) ){ $row['status'] = 'failed'; $row['error'] = $res; }
+			elseif ( is_array( $res ) ) { $row = array_merge( $row, $res ); if ( empty( $row['status'] ) ) { $row['status'] = 'ok'; } }
+			else                        { $row['status'] = 'ok'; }
+		} catch ( \Throwable $e ) {
+			$row['status'] = 'failed';
+			$row['error']  = $e->getMessage();
+		}
+		ob_end_clean();
+		return $row;
+	}
+
+	/** True when a cache plugin is present, judged by its own classes/functions or its purge hook. */
+	private static function plugin_present( array $classes, array $functions = [], $hook = '' ) {
+		foreach ( $classes as $c )   { if ( class_exists( $c ) ) { return true; } }
+		foreach ( $functions as $f ) { if ( function_exists( $f ) ) { return true; } }
+		return $hook && has_action( $hook );
+	}
+
+	/** Which purgers this site actually has — shown on the settings page. */
+	public static function detected_purgers() {
+		$found = [];
+		if ( self::plugin_present( [ '\LiteSpeed\Core', 'LiteSpeed_Cache_API', 'LiteSpeed_Cache' ], [], 'litespeed_purge_all' ) ) { $found[] = 'LiteSpeed Cache'; }
+		if ( self::plugin_present( [ '\SiteGround_Optimizer\Supercacher\Supercacher' ], [ 'sg_cachepress_purge_everything' ], 'siteground_optimizer_flush_cache' ) ) { $found[] = 'SiteGround Optimizer'; }
+		if ( self::plugin_present( [ '\Elementor\Plugin' ] ) )                       { $found[] = 'Elementor CSS'; }
+		if ( self::plugin_present( [], [ 'rocket_clean_domain' ] ) )                 { $found[] = 'WP Rocket'; }
+		if ( self::plugin_present( [], [ 'w3tc_flush_all' ] ) )                      { $found[] = 'W3 Total Cache'; }
+		if ( self::plugin_present( [], [ 'wp_cache_clear_cache' ] ) )                { $found[] = 'WP Super Cache'; }
+		if ( isset( $GLOBALS['wp_fastest_cache'] ) )                                 { $found[] = 'WP Fastest Cache'; }
+		if ( self::plugin_present( [ 'autoptimizeCache' ] ) )                        { $found[] = 'Autoptimize'; }
+		if ( self::plugin_present( [ 'Breeze_Admin' ], [], 'breeze_clear_all_cache' ) ) { $found[] = 'Breeze'; }
+		if ( self::plugin_present( [], [], 'cloudflare_purge_everything' ) )         { $found[] = 'Cloudflare'; }
+		if ( self::plugin_present( [ 'Nginx_Helper' ], [], 'rt_nginx_helper_purge_all' ) ) { $found[] = 'Nginx Helper'; }
+		if ( self::plugin_present( [ 'VarnishPurger' ], [], 'vhp_flush_all' ) )      { $found[] = 'Varnish HTTP Purge'; }
+		if ( self::plugin_present( [ '\RankMath\Sitemap\Cache' ] ) )                 { $found[] = 'Rank Math sitemap'; }
+		if ( wp_using_ext_object_cache() )                                           { $found[] = 'External object cache'; }
+		return $found;
+	}
+
+	/** POST /purge — body: { ids?:[], urls?:[], all?:bool, verify?:bool } */
+	public static function purge_endpoint( WP_REST_Request $r ) {
+		$ids    = array_values( array_unique( array_filter( array_map( 'intval', (array) $r->get_param( 'ids' ) ) ) ) );
+		$urls   = array_values( array_filter( array_map( 'esc_url_raw', (array) $r->get_param( 'urls' ) ) ) );
+		$all    = null === $r->get_param( 'all' )    ? ( ! $ids && ! $urls ) : (bool) $r->get_param( 'all' );
+		$verify = null === $r->get_param( 'verify' ) ? true : (bool) $r->get_param( 'verify' );
+		return self::run_purge( $ids, $urls, $all, $verify );
+	}
+
+	/**
+	 * Every purger we know, each independent. Never throws, never returns an error status:
+	 * a failed purge must not make the edit that triggered it look failed.
+	 *
+	 * @param bool $touch Re-save the posts to fire host purge hooks. Skipped when the
+	 *                    caller just saved them itself (wp_update_post already fired).
+	 */
+	public static function run_purge( array $ids = [], array $urls = [], $all = true, $verify = false, $touch = true ) {
+		$t0    = microtime( true );
+		$left  = static function () use ( $t0 ) { return self::PURGE_BUDGET - ( microtime( true ) - $t0 ); };
+		$ran   = [];
+		$posts = array_values( array_filter( array_map( 'get_post', $ids ) ) );
+
+		foreach ( $posts as $p ) { $urls[] = get_permalink( $p ); }
+		$urls = array_values( array_unique( array_filter( $urls ) ) );
+
+		$purgers = [
+			'object_cache' => static function () { wp_cache_flush(); return true; },
+
+			'elementor_css' => static function () use ( $ids ) {
+				if ( ! class_exists( '\Elementor\Plugin' ) ) { return null; }
+				foreach ( $ids as $id ) { delete_post_meta( $id, '_elementor_css' ); }
+				$fm = \Elementor\Plugin::$instance->files_manager ?? null;
+				if ( $fm && method_exists( $fm, 'clear_cache' ) ) { $fm->clear_cache(); }
+				return true;
+			},
+
+			'litespeed' => static function () {
+				if ( ! self::plugin_present( [ '\LiteSpeed\Core', 'LiteSpeed_Cache_API', 'LiteSpeed_Cache' ], [], 'litespeed_purge_all' ) ) { return null; }
+				do_action( 'litespeed_purge_all' );
+				if ( class_exists( 'LiteSpeed_Cache_API' ) && method_exists( 'LiteSpeed_Cache_API', 'purge_all' ) ) { LiteSpeed_Cache_API::purge_all(); }
+				return true;
+			},
+
+			'sg_optimizer' => static function () {
+				if ( ! self::plugin_present( [ '\SiteGround_Optimizer\Supercacher\Supercacher' ], [ 'sg_cachepress_purge_everything' ], 'siteground_optimizer_flush_cache' ) ) { return null; }
+				if ( function_exists( 'sg_cachepress_purge_everything' ) ) { sg_cachepress_purge_everything(); }
+				do_action( 'siteground_optimizer_flush_cache' );
+				if ( method_exists( '\SiteGround_Optimizer\Supercacher\Supercacher', 'purge_cache' ) ) { \SiteGround_Optimizer\Supercacher\Supercacher::purge_cache(); }
+				return true;
+			},
+
+			'wp_rocket' => static function () use ( $ids ) {
+				if ( ! function_exists( 'rocket_clean_domain' ) ) { return null; }
+				if ( $ids && function_exists( 'rocket_clean_post' ) ) { foreach ( $ids as $id ) { rocket_clean_post( $id ); } }
+				rocket_clean_domain();
+				return true;
+			},
+
+			'w3_total_cache'  => static function () { if ( ! function_exists( 'w3tc_flush_all' ) ) { return null; } w3tc_flush_all(); return true; },
+			'wp_super_cache'  => static function () { if ( ! function_exists( 'wp_cache_clear_cache' ) ) { return null; } wp_cache_clear_cache(); return true; },
+
+			'wp_fastest_cache' => static function () {
+				$wpfc = $GLOBALS['wp_fastest_cache'] ?? null;
+				if ( ! $wpfc || ! method_exists( $wpfc, 'deleteCache' ) ) { return null; }
+				$wpfc->deleteCache( true );
+				return true;
+			},
+
+			'autoptimize' => static function () {
+				if ( ! class_exists( 'autoptimizeCache' ) || ! method_exists( 'autoptimizeCache', 'clearall' ) ) { return null; }
+				autoptimizeCache::clearall();
+				return true;
+			},
+
+			'breeze'       => static function () { if ( ! self::plugin_present( [ 'Breeze_Admin' ], [], 'breeze_clear_all_cache' ) ) { return null; } do_action( 'breeze_clear_all_cache' ); return true; },
+			'cloudflare'   => static function () { if ( ! has_action( 'cloudflare_purge_everything' ) ) { return null; } do_action( 'cloudflare_purge_everything' ); return true; },
+			'nginx_helper' => static function () { if ( ! self::plugin_present( [ 'Nginx_Helper' ], [], 'rt_nginx_helper_purge_all' ) ) { return null; } do_action( 'rt_nginx_helper_purge_all' ); return true; },
+			'varnish'      => static function () { if ( ! self::plugin_present( [ 'VarnishPurger' ], [], 'vhp_flush_all' ) ) { return null; } do_action( 'vhp_flush_all' ); return true; },
+
+			'rankmath_sitemap' => static function () {
+				if ( ! class_exists( '\RankMath\Sitemap\Cache' ) ) { return null; }
+				\RankMath\Sitemap\Cache::invalidate_storage();
+				return true;
+			},
+
+			// Hosts with an nginx proxy and no plugin (SiteGround Dynamic Cache). Usually
+			// refused from outside the proxy — record the code and carry on.
+			'nginx_purge_request' => static function () use ( $urls, $all ) {
+				$targets = $urls ? $urls : ( $all ? [ home_url( '/' ) ] : [] );
+				if ( ! $targets ) { return null; }
+				$codes = [];
+				foreach ( array_slice( $targets, 0, 10 ) as $u ) {
+					$resp    = wp_remote_request( $u, [ 'method' => 'PURGE', 'timeout' => 10, 'sslverify' => false ] );
+					$codes[] = is_wp_error( $resp ) ? $resp->get_error_message() : wp_remote_retrieve_response_code( $resp );
+				}
+				$ok = (bool) array_filter( $codes, static function ( $c ) { return is_numeric( $c ) && $c >= 200 && $c < 300; } );
+				return [ 'status' => $ok ? 'ok' : 'failed', 'codes' => $codes ];
+			},
+
+			'opcache' => static function () {
+				if ( ! function_exists( 'opcache_reset' ) ) { return null; }
+				$disabled = array_map( 'trim', explode( ',', (string) ini_get( 'disable_functions' ) ) );
+				if ( in_array( 'opcache_reset', $disabled, true ) ) { return null; }
+				return opcache_reset() ? true : 'opcache_reset() returned false';
+			},
+
+			// Last, and the only one proven to work on hosts whose purge runs on post save.
+			'wp_update_post' => static function () use ( $posts, $all, $touch ) {
+				if ( ! $touch ) { return [ 'status' => 'skipped', 'reason' => 'post was just saved by this request' ]; }
+				$targets = $posts;
+				if ( ! $targets && $all ) {
+					$front = (int) get_option( 'page_on_front' );
+					if ( $front ) { $targets = array_filter( [ get_post( $front ) ] ); }
+					if ( ! $targets ) {
+						$targets = get_posts( [ 'post_type' => [ 'page', 'post' ], 'post_status' => 'publish', 'numberposts' => 1, 'orderby' => 'modified', 'order' => 'DESC' ] );
+					}
+				}
+				if ( ! $targets ) { return null; }
+				$done = [];
+				foreach ( $targets as $p ) {
+					$res = wp_update_post( [ 'ID' => $p->ID ], true );
+					if ( ! is_wp_error( $res ) ) { $done[] = $p->ID; }
+				}
+				return $done ? [ 'status' => 'ok', 'ids' => $done ] : 'wp_update_post failed';
+			},
+		];
+
+		foreach ( $purgers as $name => $fn ) {
+			if ( $left() <= 1 ) { $ran[] = [ 'purger' => $name, 'status' => 'skipped', 'reason' => 'time budget reached' ]; continue; }
+			$ran[] = self::try_purge( $name, $fn );
+		}
+
+		$out = [
+			'ok'  => (bool) array_filter( $ran, static function ( $r ) { return 'ok' === $r['status']; } ),
+			'ran' => $ran,
+		];
+
+		if ( $verify && $left() > 3 ) {
+			$url  = $posts ? get_permalink( $posts[0] ) : home_url( '/' );
+			$resp = wp_remote_get( $url, [ 'timeout' => 10, 'sslverify' => false, 'headers' => [ 'Cache-Control' => 'no-cache' ] ] );
+			if ( is_wp_error( $resp ) ) {
+				$out['verify'] = [ 'url' => $url, 'error' => $resp->get_error_message() ];
+			} else {
+				$check = [ 'url' => $url, 'http' => wp_remote_retrieve_response_code( $resp ) ];
+				foreach ( [ 'x-proxy-cache', 'x-litespeed-cache', 'cf-cache-status', 'x-cache', 'x-sg-cache' ] as $h ) {
+					$v = wp_remote_retrieve_header( $resp, $h );
+					if ( $v ) { $check[ $h ] = is_array( $v ) ? implode( ', ', $v ) : $v; }
+				}
+				$out['verify'] = $check;
+			}
+		} elseif ( $verify ) {
+			$out['verify'] = [ 'status' => 'skipped', 'reason' => 'time budget reached' ];
+		}
+
+		foreach ( $posts as $p ) { self::queue( $p, 'edited', [ 'Cache purged' ] ); }
+		return $out;
+	}
+
+	/** Purge after a write, unless the caller passed "purge": false. Returns a compact summary. */
+	private static function auto_purge( WP_REST_Request $r, array $ids, $touch = false ) {
+		if ( false === filter_var( $r->get_param( 'purge' ) ?? true, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE ) ) { return [ 'skipped' => true ]; }
+		$report  = self::silently( static function () use ( $ids, $touch ) { return self::run_purge( $ids, [], false, false, $touch ); } );
+		$summary = [];
+		foreach ( $report['ran'] as $row ) {
+			if ( 'absent' !== $row['status'] ) { $summary[ $row['purger'] ] = $row['status']; }
+		}
+		return $summary;
 	}
 
 	/** POST /cache/flush — clears RankMath sitemap cache, SiteGround cache, Elementor CSS and the object cache where present. */
@@ -677,6 +1019,15 @@ class Claude_Bridge {
 		</h1>
 
 		<table class="form-table" style="max-width:820px">
+		<tr><th style="width:160px">Cache</th><td>
+			<a class="button button-primary" href="<?php echo esc_url( self::purge_url() ); ?>">⟳ Purge cache now</a>
+			<span style="color:#666;margin-left:10px">Clears every cache on this site, then checks whether the page is served fresh.</span>
+			<p class="description" style="margin-top:8px">
+				<?php $d = self::detected_purgers(); ?>
+				Found here: <?php echo $d ? '<code>' . implode( '</code>, <code>', array_map( 'esc_html', $d ) ) . '</code>' : 'no cache plugins — purging falls back to re-saving a page, which is what clears host caches like SiteGround Dynamic Cache'; ?>.<br>
+				There is also a <strong>⟳ Purge cache</strong> button in the toolbar at the top of every admin page.
+			</p>
+		</td></tr>
 		<tr><th style="width:160px">API base</th><td><code><?php echo esc_html( $base ); ?></code></td></tr>
 		<tr><th>Token</th><td>
 			<input type="text" readonly onclick="this.select()" style="width:100%;max-width:560px;font-family:monospace;padding:8px" value="<?php echo esc_attr( $token ); ?>"><br>
@@ -724,12 +1075,15 @@ class Claude_Bridge {
 		<tr><td><code>GET  /redirects</code></td><td>—</td><td>List managed redirects</td></tr>
 		<tr><td><code>POST /redirects</code></td><td>add:[{from,to,code?}], remove:[from]</td><td>Add/remove 301 redirects</td></tr>
 		<tr><td><code>POST /site/404</code></td><td>id</td><td>Use an Elementor page as the site's 404 page</td></tr>
+		<tr><td><code>POST /purge</code></td><td>ids?, urls?, all?, verify?</td><td>Clear every cache this site has, then report what the server returns</td></tr>
 		<tr><td><code>POST /cache/flush</code></td><td>—</td><td>Flush RankMath sitemap, SiteGround, Elementor CSS caches</td></tr>
 		<tr><td><code>POST /self-update</code></td><td>—</td><td>Install the latest plugin version immediately</td></tr>
 		</tbody>
 		</table>
 
 		<p style="color:#666;max-width:820px;margin-top:14px">
+			<strong>Cache:</strong> writes purge the pages they touch automatically — send <code>"purge": false</code> to skip.
+			Purgers detected on this site: <?php $d = self::detected_purgers(); echo $d ? '<code>' . implode( '</code>, <code>', array_map( 'esc_html', $d ) ) . '</code>' : 'none — <code>/purge</code> falls back to re-saving the post, which is what clears host-level caches like SiteGround Dynamic Cache'; ?>.<br>
 			<strong>Auth:</strong> pass token as <code>X-Claude-Token: {token}</code> header, or append <code>?token={token}</code> to the URL.<br>
 			<strong>WAF bypass:</strong> if GoDaddy/Sucuri blocks HTML in POST bodies, base64-encode the HTML and send it as <code>content_b64</code> instead of <code>content</code>. The plugin decodes it server-side.<br>
 			<strong>Activity log:</strong> send <code>note</code> with any write to describe the change — it appears on the private activity dashboard with the page link.<br>
