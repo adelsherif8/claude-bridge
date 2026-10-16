@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.4.1
+ * Version:      1.5.0
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.4.1' );
+define( 'CB_VERSION', '1.5.0' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -208,6 +208,12 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/redirects',         [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_redirects' ] ] );
 		register_rest_route( CB_NS, '/redirects',         [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'save_redirects' ] ] );
 		register_rest_route( CB_NS, '/site/404',          [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'set_404' ] ] );
+		register_rest_route( CB_NS, '/elementor/templates',       [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_templates' ] ] );
+		register_rest_route( CB_NS, '/elementor/template/upsert', [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'upsert_template' ] ] );
+		register_rest_route( CB_NS, '/elementor/template/status', [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'template_status' ] ] );
+		register_rest_route( CB_NS, '/elementor/conditions',      [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'set_conditions' ] ] );
+		register_rest_route( CB_NS, '/option',            [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'site_option' ] ] );
+		register_rest_route( CB_NS, '/wc/products',       [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_products' ] ] );
 		register_rest_route( CB_NS, '/purge',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'purge_endpoint' ] ] );
 		register_rest_route( CB_NS, '/cache/flush',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'flush_caches' ] ] );
 		register_rest_route( CB_NS, '/self-update',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
@@ -421,6 +427,297 @@ class Claude_Bridge {
 		exit;
 	}
 
+
+	/* ─── Elementor Theme Builder ─── */
+
+	/** Theme Builder work needs Elementor Pro; without it every endpoint here is a clean 400. */
+	private static function require_pro() {
+		if ( ! class_exists( '\ElementorPro\Modules\ThemeBuilder\Module' ) ) {
+			return new WP_Error( 'elementor_pro_missing', 'Elementor Pro is not active on this site.', [ 'status' => 400, 'error' => 'elementor_pro_missing' ] );
+		}
+		return true;
+	}
+
+	private static function theme_builder() {
+		return \ElementorPro\Modules\ThemeBuilder\Module::instance();
+	}
+
+	private static function template_row( WP_Post $p ) {
+		return [
+			'id'         => $p->ID,
+			'title'      => $p->post_title,
+			'slug'       => $p->post_name,
+			'status'     => $p->post_status,
+			'type'       => get_post_meta( $p->ID, '_elementor_template_type', true ),
+			'conditions' => (array) get_post_meta( $p->ID, '_elementor_conditions', true ),
+			'modified'   => $p->post_modified_gmt,
+		];
+	}
+
+	/** GET /elementor/templates — every template, any status. */
+	public static function list_templates() {
+		$pro = self::require_pro();
+		if ( is_wp_error( $pro ) ) { return $pro; }
+		$posts = get_posts( [
+			'post_type'   => 'elementor_library',
+			'post_status' => 'any',
+			'numberposts' => 200,
+			'orderby'     => 'modified',
+			'order'       => 'DESC',
+		] );
+		return array_map( [ __CLASS__, 'template_row' ], $posts );
+	}
+
+	/**
+	 * "include/product_archive/shop_page" → the array shape Elementor Pro stores.
+	 * Elementor's own format is type/name/sub_name/sub_id joined by slashes.
+	 */
+	private static function parse_condition( $str ) {
+		$parts = array_values( array_filter( explode( '/', trim( (string) $str ) ) ) );
+		if ( ! $parts ) { return null; }
+		$type = in_array( $parts[0], [ 'include', 'exclude' ], true ) ? array_shift( $parts ) : 'include';
+		return array_filter( [
+			'type'     => $type,
+			'name'     => $parts[0] ?? 'general',
+			'sub_name' => $parts[1] ?? '',
+			'sub_id'   => isset( $parts[2] ) ? (int) $parts[2] : '',
+		], static function ( $v ) { return '' !== $v; } );
+	}
+
+	/** Save conditions through Elementor Pro so its cache updates, not just the meta row. */
+	private static function apply_conditions( $id, array $conditions ) {
+		$parsed = array_values( array_filter( array_map( [ __CLASS__, 'parse_condition' ], $conditions ) ) );
+		$manager = self::theme_builder()->get_conditions_manager();
+		$manager->save_conditions( $id, $parsed );
+		if ( method_exists( $manager, 'get_cache' ) ) { $manager->get_cache()->regenerate(); }
+		return (array) get_post_meta( $id, '_elementor_conditions', true );
+	}
+
+	/** Drop generated CSS for one template so the new layout actually renders. */
+	private static function clear_template_css( $id ) {
+		delete_post_meta( $id, '_elementor_css' );
+		if ( class_exists( '\Elementor\Plugin' ) ) {
+			$fm = \Elementor\Plugin::$instance->files_manager ?? null;
+			if ( $fm && method_exists( $fm, 'clear_cache' ) ) { $fm->clear_cache(); }
+		}
+	}
+
+	/** POST /elementor/template/upsert — body: { id?, title, type, status?, data_b64, page_settings?, conditions?, note? } */
+	public static function upsert_template( WP_REST_Request $r ) {
+		$pro = self::require_pro();
+		if ( is_wp_error( $pro ) ) { return $pro; }
+
+		$id    = (int) $r->get_param( 'id' );
+		$title = sanitize_text_field( (string) $r->get_param( 'title' ) );
+		$type  = sanitize_key( str_replace( '-', '_', (string) $r->get_param( 'type' ) ) );
+		$type  = str_replace( '_', '-', $type ); // Elementor uses hyphens: product-archive, single-post, error-404
+		if ( ! $type ) { return new WP_Error( 'missing', 'type is required.', [ 'status' => 400 ] ); }
+		if ( ! $id && ! $title ) { return new WP_Error( 'missing', 'title is required when creating.', [ 'status' => 400 ] ); }
+
+		$existing = $id ? get_post( $id ) : null;
+		if ( $id && ( ! $existing || 'elementor_library' !== $existing->post_type ) ) {
+			return new WP_Error( 'not_found', 'Template not found.', [ 'status' => 404 ] );
+		}
+
+		// Snapshot before touching anything, so the caller can roll back.
+		$previous = $existing ? [
+			'data'       => (string) get_post_meta( $id, '_elementor_data', true ),
+			'conditions' => (array) get_post_meta( $id, '_elementor_conditions', true ),
+			'status'     => $existing->post_status,
+			'title'      => $existing->post_title,
+		] : null;
+
+		// Validate the payload before creating anything, so bad input leaves no orphan template.
+		$b64  = (string) $r->get_param( 'data_b64' );
+		$json = null;
+		if ( '' !== $b64 ) {
+			$json = base64_decode( $b64, true );
+			if ( false === $json )                      { return new WP_Error( 'bad_data', 'data_b64 is not valid base64.', [ 'status' => 400 ] ); }
+			if ( null === json_decode( $json, true ) )  { return new WP_Error( 'bad_data', 'data_b64 does not decode to valid JSON.', [ 'status' => 400 ] ); }
+		}
+
+		$status = $r->get_param( 'status' ) ? self::safe_status( $r->get_param( 'status' ) ) : ( $existing->post_status ?? 'publish' );
+		$args   = [ 'post_type' => 'elementor_library', 'post_status' => $status ];
+		if ( $title )    { $args['post_title'] = $title; }
+		if ( $existing ) { $args['ID'] = $id; } else { $args['post_author'] = get_current_user_id(); }
+
+		$saved = self::silently( static function () use ( $args, $existing ) {
+			return $existing ? wp_update_post( $args, true ) : wp_insert_post( $args, true );
+		} );
+		if ( is_wp_error( $saved ) ) { return $saved; }
+		$id = $existing ? $id : (int) $saved;
+
+		// _elementor_data holds raw JSON with <script>/<style> inside HTML widgets — it must
+		// not go through kses, only wp_slash so WP doesn't eat the backslashes.
+		if ( null !== $json ) { update_metadata( 'post', $id, '_elementor_data', wp_slash( $json ) ); }
+
+		$settings = $r->get_param( 'page_settings' );
+		if ( is_array( $settings ) ) { update_post_meta( $id, '_elementor_page_settings', $settings ); }
+
+		update_post_meta( $id, '_elementor_template_type', $type );
+		update_post_meta( $id, '_elementor_edit_mode', 'builder' );
+		if ( defined( 'ELEMENTOR_VERSION' ) ) { update_post_meta( $id, '_elementor_version', ELEMENTOR_VERSION ); }
+
+		// Elementor's library and Theme Builder list templates by this taxonomy, not the meta.
+		wp_set_object_terms( $id, $type, 'elementor_library_type' );
+
+		$out = [ 'ok' => true, 'action' => $existing ? 'updated' : 'created', 'id' => $id, 'type' => $type, 'status' => get_post_status( $id ) ];
+
+		$conditions = $r->get_param( 'conditions' );
+		if ( is_array( $conditions ) ) {
+			try {
+				$out['conditions'] = self::apply_conditions( $id, $conditions );
+			} catch ( \Throwable $e ) {
+				$out['conditions_error'] = $e->getMessage();
+			}
+		}
+
+		self::clear_template_css( $id );
+		self::queue( get_post( $id ), $existing ? 'edited' : 'created', [ ucfirst( $type ) . ' template ' . ( $existing ? 'updated' : 'created' ) ] );
+
+		$out['edit']     = admin_url( 'post.php?post=' . $id . '&action=elementor' );
+		$out['previous'] = $previous;
+		$out['purged']   = self::auto_purge( $r, [ $id ], true );
+		return $out;
+	}
+
+	/** POST /elementor/template/status — body: { id, status, note? } */
+	public static function template_status( WP_REST_Request $r ) {
+		$pro = self::require_pro();
+		if ( is_wp_error( $pro ) ) { return $pro; }
+
+		$id = (int) $r->get_param( 'id' );
+		$p  = get_post( $id );
+		if ( ! $p || 'elementor_library' !== $p->post_type ) { return new WP_Error( 'not_found', 'Template not found.', [ 'status' => 404 ] ); }
+
+		$was    = $p->post_status;
+		$status = self::safe_status( $r->get_param( 'status' ) );
+		$res    = self::silently( static function () use ( $id, $status ) { return wp_update_post( [ 'ID' => $id, 'post_status' => $status ], true ); } );
+		if ( is_wp_error( $res ) ) { return $res; }
+
+		$out = [ 'ok' => true, 'id' => $id, 'was' => $was, 'status' => get_post_status( $id ) ];
+
+		// Conditions are cached per published template, so the cache must be rebuilt.
+		try {
+			$manager = self::theme_builder()->get_conditions_manager();
+			if ( method_exists( $manager, 'get_cache' ) ) { $manager->get_cache()->regenerate(); }
+		} catch ( \Throwable $e ) {
+			$out['cache_error'] = $e->getMessage();
+		}
+
+		self::queue( get_post( $id ), 'edited', [ "Template status: {$was} → {$status}" ] );
+		$out['purged'] = self::auto_purge( $r, [ $id ], true );
+		return $out;
+	}
+
+	/** POST /elementor/conditions — body: { id, conditions:[], note? } */
+	public static function set_conditions( WP_REST_Request $r ) {
+		$pro = self::require_pro();
+		if ( is_wp_error( $pro ) ) { return $pro; }
+
+		$id = (int) $r->get_param( 'id' );
+		$p  = get_post( $id );
+		if ( ! $p || 'elementor_library' !== $p->post_type ) { return new WP_Error( 'not_found', 'Template not found.', [ 'status' => 404 ] ); }
+
+		$conditions = $r->get_param( 'conditions' );
+		if ( ! is_array( $conditions ) ) { return new WP_Error( 'missing', 'conditions must be an array of strings.', [ 'status' => 400 ] ); }
+
+		$previous = (array) get_post_meta( $id, '_elementor_conditions', true );
+		try {
+			$now = self::apply_conditions( $id, $conditions );
+		} catch ( \Throwable $e ) {
+			return new WP_Error( 'conditions_failed', $e->getMessage(), [ 'status' => 500 ] );
+		}
+
+		self::clear_template_css( $id );
+		self::queue( $p, 'edited', [ 'Display conditions: ' . ( $now ? implode( ', ', $now ) : 'none' ) ] );
+		return [ 'ok' => true, 'id' => $id, 'previous' => $previous, 'conditions' => $now, 'purged' => self::auto_purge( $r, [ $id ], true ) ];
+	}
+
+	/* ─── site options (allowlisted) + WooCommerce reads ─── */
+
+	const OPTION_ALLOWLIST = [
+		'show_on_front', 'page_on_front', 'page_for_posts',
+		'woocommerce_shop_page_id', 'woocommerce_cart_page_id',
+		'woocommerce_checkout_page_id', 'woocommerce_myaccount_page_id',
+	];
+
+	/** POST /option — body: { key, value? } — read when value is omitted. Allowlisted keys only. */
+	public static function site_option( WP_REST_Request $r ) {
+		$key = (string) $r->get_param( 'key' );
+		if ( ! in_array( $key, self::OPTION_ALLOWLIST, true ) ) {
+			return new WP_Error( 'forbidden', 'That option is not allowed. Allowed: ' . implode( ', ', self::OPTION_ALLOWLIST ), [ 'status' => 403 ] );
+		}
+		if ( null === $r->get_param( 'value' ) ) { return [ 'key' => $key, 'value' => get_option( $key ) ]; }
+
+		$value = $r->get_param( 'value' );
+		$value = is_numeric( $value ) ? (int) $value : sanitize_text_field( (string) $value );
+		$was   = get_option( $key );
+		update_option( $key, $value );
+		return [ 'ok' => true, 'key' => $key, 'was' => $was, 'value' => get_option( $key ), 'purged' => self::auto_purge( $r, [], false ) ];
+	}
+
+	/** GET /wc/products — read-only product data for designing templates. Never writes. */
+	public static function list_products( WP_REST_Request $r ) {
+		if ( ! function_exists( 'wc_get_products' ) ) {
+			return new WP_Error( 'woocommerce_missing', 'WooCommerce is not active on this site.', [ 'status' => 400, 'error' => 'woocommerce_missing' ] );
+		}
+		$products = wc_get_products( [
+			'limit'   => min( 100, (int) ( $r->get_param( 'limit' ) ?: 20 ) ),
+			'status'  => [ 'publish', 'draft', 'private' ],
+			'search'  => (string) $r->get_param( 'search' ),
+			'orderby' => 'date',
+			'order'   => 'DESC',
+		] );
+
+		$out = [];
+		foreach ( $products as $p ) {
+			$row = [
+				'id'                => $p->get_id(),
+				'name'              => $p->get_name(),
+				'slug'              => $p->get_slug(),
+				'status'            => $p->get_status(),
+				'type'              => $p->get_type(),
+				'virtual'           => $p->is_virtual(),
+				'downloadable'      => $p->is_downloadable(),
+				'regular_price'     => $p->get_regular_price(),
+				'sale_price'        => $p->get_sale_price(),
+				'price'             => $p->get_price(),
+				'short_description' => wp_strip_all_tags( (string) $p->get_short_description() ),
+				'categories'        => wp_get_post_terms( $p->get_id(), 'product_cat', [ 'fields' => 'names' ] ),
+				'image'             => wp_get_attachment_url( $p->get_image_id() ) ?: '',
+				'gallery_count'     => count( $p->get_gallery_image_ids() ),
+				'permalink'         => get_permalink( $p->get_id() ),
+				'attributes'        => [],
+			];
+
+			foreach ( $p->get_attributes() as $name => $attr ) {
+				$row['attributes'][] = [
+					'name'    => is_object( $attr ) && method_exists( $attr, 'get_name' ) ? $attr->get_name() : (string) $name,
+					'options' => is_object( $attr ) && method_exists( $attr, 'get_slugs' ) ? $attr->get_slugs() : [],
+				];
+			}
+
+			if ( $p->is_type( 'variable' ) && method_exists( $p, 'get_available_variations' ) ) {
+				$row['variations'] = array_map( static function ( $v ) {
+					return [ 'id' => $v['variation_id'], 'attributes' => $v['attributes'], 'price' => $v['display_price'] ?? null ];
+				}, (array) $p->get_available_variations() );
+			}
+
+			// WooCommerce Product Add-ons, when present — fields a product template may need to render.
+			if ( class_exists( 'WC_Product_Addons_Helper' ) && method_exists( 'WC_Product_Addons_Helper', 'get_product_addons' ) ) {
+				$addons = WC_Product_Addons_Helper::get_product_addons( $p->get_id() );
+				if ( $addons ) {
+					$row['addons'] = array_map( static function ( $a ) {
+						return [ 'name' => $a['name'] ?? '', 'type' => $a['type'] ?? '', 'required' => ! empty( $a['required'] ), 'options' => count( (array) ( $a['options'] ?? [] ) ) ];
+					}, (array) $addons );
+				}
+			}
+
+			$out[] = $row;
+		}
+		return $out;
+	}
 
 	/* ─── cache purging ─── */
 
@@ -1079,6 +1376,12 @@ class Claude_Bridge {
 		<tr><td><code>GET  /redirects</code></td><td>—</td><td>List managed redirects</td></tr>
 		<tr><td><code>POST /redirects</code></td><td>add:[{from,to,code?}], remove:[from]</td><td>Add/remove 301 redirects</td></tr>
 		<tr><td><code>POST /site/404</code></td><td>id</td><td>Use an Elementor page as the site's 404 page</td></tr>
+		<tr><td><code>GET  /elementor/templates</code></td><td>—</td><td>List Theme Builder templates (type, conditions, status)</td></tr>
+		<tr><td><code>POST /elementor/template/upsert</code></td><td>id?, title, type, status?, data_b64, page_settings?, conditions?</td><td>Create or update a Theme Builder template</td></tr>
+		<tr><td><code>POST /elementor/template/status</code></td><td>id, status</td><td>Publish or unpublish a template</td></tr>
+		<tr><td><code>POST /elementor/conditions</code></td><td>id, conditions:[…]</td><td>Set where a template displays</td></tr>
+		<tr><td><code>POST /option</code></td><td>key, value? (omit to read)</td><td>Read/write allowlisted site options (front page, WooCommerce pages)</td></tr>
+		<tr><td><code>GET  /wc/products</code></td><td>?search=&amp;limit=</td><td>Read product data (read-only — never writes prices)</td></tr>
 		<tr><td><code>POST /purge</code></td><td>ids?, urls?, all?, verify?</td><td>Clear every cache this site has, then report what the server returns</td></tr>
 		<tr><td><code>POST /cache/flush</code></td><td>—</td><td>Flush RankMath sitemap, SiteGround, Elementor CSS caches</td></tr>
 		<tr><td><code>POST /self-update</code></td><td>—</td><td>Install the latest plugin version immediately</td></tr>
