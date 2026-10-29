@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.5.0
+ * Version:      1.5.1
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.5.0' );
+define( 'CB_VERSION', '1.5.1' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -214,6 +214,7 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/elementor/conditions',      [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'set_conditions' ] ] );
 		register_rest_route( CB_NS, '/option',            [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'site_option' ] ] );
 		register_rest_route( CB_NS, '/wc/products',       [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_products' ] ] );
+		register_rest_route( CB_NS, '/cftg/entries',      [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'cftg_entries' ] ] );
 		register_rest_route( CB_NS, '/purge',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'purge_endpoint' ] ] );
 		register_rest_route( CB_NS, '/cache/flush',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'flush_caches' ] ] );
 		register_rest_route( CB_NS, '/self-update',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
@@ -717,6 +718,78 @@ class Claude_Bridge {
 			$out[] = $row;
 		}
 		return $out;
+	}
+
+	/* ─── CFT Group Forms (read-only) ─── */
+
+	/**
+	 * GET /cftg/entries — body/query: { since?, status?, form?, limit?, offset? }
+	 * Read-only view of the CFT Group Forms entries table. Never writes, and never returns
+	 * the ip column, the raw request, or the full raw response.
+	 */
+	public static function cftg_entries( WP_REST_Request $r ) {
+		global $wpdb;
+
+		$table = $wpdb->prefix . 'cftg_entries';
+		$found = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ); // phpcs:ignore WordPress.DB
+		if ( $found !== $table ) {
+			return new WP_Error( 'cftg_missing', 'cftg_entries table not found', [ 'status' => 404, 'error' => 'cftg_entries table not found' ] );
+		}
+
+		$where  = [ '1=1' ];
+		$params = [];
+
+		$since = (string) $r->get_param( 'since' );
+		if ( $since && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $since ) ) {
+			$where[]  = 'created_at >= %s';
+			$params[] = $since . ' 00:00:00';
+		}
+
+		$status = (string) $r->get_param( 'status' );
+		if ( in_array( $status, [ 'sent', 'failed', 'pending' ], true ) ) {
+			$where[]  = 'ghl_status = %s';
+			$params[] = $status;
+		}
+
+		$form = sanitize_key( (string) $r->get_param( 'form' ) );
+		if ( $form ) {
+			$where[]  = 'form_type = %s';
+			$params[] = $form;
+		}
+
+		$limit  = min( 2000, max( 1, (int) ( $r->get_param( 'limit' ) ?: 500 ) ) );
+		$offset = max( 0, (int) $r->get_param( 'offset' ) );
+		$clause = implode( ' AND ', $where );
+
+		// $table is built from $wpdb->prefix and $clause only ever holds %s placeholders;
+		// every request value goes through prepare().
+		$total = (int) ( $params
+			? $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$table}` WHERE {$clause}", $params ) ) // phpcs:ignore WordPress.DB
+			: $wpdb->get_var( "SELECT COUNT(*) FROM `{$table}`" ) ); // phpcs:ignore WordPress.DB
+
+		$sql  = "SELECT id, created_at, form_type, first_name, last_name, email, phone, postal, tag, ghl_status, ghl_message, data
+			FROM `{$table}` WHERE {$clause} ORDER BY id DESC LIMIT %d OFFSET %d";
+		$rows = $wpdb->get_results( $wpdb->prepare( $sql, array_merge( $params, [ $limit, $offset ] ) ), ARRAY_A ); // phpcs:ignore WordPress.DB
+
+		$out = [];
+		foreach ( (array) $rows as $row ) {
+			$data = json_decode( (string) ( $row['data'] ?? '' ), true );
+			$data = is_array( $data ) ? $data : [];
+			unset( $row['data'] );
+
+			$resp = json_decode( (string) ( $data['_ghl_response'] ?? '' ), true );
+			$resp = is_array( $resp ) ? $resp : [];
+
+			$row['ghl_http']       = $data['_ghl_http'] ?? null;
+			$row['ghl_new']        = array_key_exists( 'new', $resp ) ? (bool) $resp['new'] : null;
+			$row['ghl_contact_id'] = $resp['contact']['id'] ?? null;
+			$row['ghl_error']      = $resp['message'] ?? null;
+			$row['retag_http']     = $data['_ghl_retag_http'] ?? null;
+
+			$out[] = $row;
+		}
+
+		return [ 'total' => $total, 'count' => count( $out ), 'rows' => $out ];
 	}
 
 	/* ─── cache purging ─── */
@@ -1382,6 +1455,7 @@ class Claude_Bridge {
 		<tr><td><code>POST /elementor/conditions</code></td><td>id, conditions:[…]</td><td>Set where a template displays</td></tr>
 		<tr><td><code>POST /option</code></td><td>key, value? (omit to read)</td><td>Read/write allowlisted site options (front page, WooCommerce pages)</td></tr>
 		<tr><td><code>GET  /wc/products</code></td><td>?search=&amp;limit=</td><td>Read product data (read-only — never writes prices)</td></tr>
+		<tr><td><code>GET  /cftg/entries</code></td><td>since?, status?, form?, limit?, offset?</td><td>Read CFT Group Forms entries (read-only)</td></tr>
 		<tr><td><code>POST /purge</code></td><td>ids?, urls?, all?, verify?</td><td>Clear every cache this site has, then report what the server returns</td></tr>
 		<tr><td><code>POST /cache/flush</code></td><td>—</td><td>Flush RankMath sitemap, SiteGround, Elementor CSS caches</td></tr>
 		<tr><td><code>POST /self-update</code></td><td>—</td><td>Install the latest plugin version immediately</td></tr>
