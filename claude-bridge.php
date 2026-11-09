@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.5.1
+ * Version:      1.6.0
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.5.1' );
+define( 'CB_VERSION', '1.6.0' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -212,6 +212,9 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/elementor/template/upsert', [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'upsert_template' ] ] );
 		register_rest_route( CB_NS, '/elementor/template/status', [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'template_status' ] ] );
 		register_rest_route( CB_NS, '/elementor/conditions',      [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'set_conditions' ] ] );
+		register_rest_route( CB_NS, '/plugin-settings',         [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'get_plugin_settings' ] ] );
+		register_rest_route( CB_NS, '/plugin-settings',         [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'set_plugin_settings' ] ] );
+		register_rest_route( CB_NS, '/plugin-settings/restore', [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'restore_plugin_settings' ] ] );
 		register_rest_route( CB_NS, '/option',            [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'site_option' ] ] );
 		register_rest_route( CB_NS, '/wc/products',       [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_products' ] ] );
 		register_rest_route( CB_NS, '/cftg/entries',      [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'cftg_entries' ] ] );
@@ -790,6 +793,193 @@ class Claude_Bridge {
 		}
 
 		return [ 'total' => $total, 'count' => count( $out ), 'rows' => $out ];
+	}
+
+	/* ─── plugin settings (allowlisted options, merge + backup + restore) ─── */
+
+	/** Only these options may be read or written. cfg_aligner_steps is CFG_ALG_OPTION's real name. */
+	const PLUGIN_OPTION_ALLOWLIST = [ 'cfg_settings', 'cfg_aligner_steps', 'cfg_review_settings' ];
+
+	/** Defaults function per option, used to decide which keys are legitimate. */
+	const PLUGIN_OPTION_DEFAULTS = [
+		'cfg_settings'        => 'cfg_defaults',
+		'cfg_aligner_steps'   => 'cfg_aligner_defaults',
+		'cfg_review_settings' => 'cfg_review_defaults',
+	];
+
+	private static function check_option_name( $option ) {
+		if ( ! in_array( $option, self::PLUGIN_OPTION_ALLOWLIST, true ) ) {
+			return new WP_Error( 'forbidden', 'That option is not allowed. Allowed: ' . implode( ', ', self::PLUGIN_OPTION_ALLOWLIST ), [ 'status' => 403 ] );
+		}
+		return true;
+	}
+
+	/** Keys that already exist in the stored option, plus the plugin's own defaults. */
+	private static function known_keys( $option, array $stored ) {
+		$keys = array_keys( $stored );
+		$fn   = self::PLUGIN_OPTION_DEFAULTS[ $option ] ?? '';
+		if ( $fn && function_exists( $fn ) ) {
+			$defaults = $fn();
+			if ( is_array( $defaults ) ) { $keys = array_merge( $keys, array_keys( $defaults ) ); }
+		}
+		return array_values( array_unique( $keys ) );
+	}
+
+	private static function backup_key( $option ) {
+		return 'claude_bridge_backup_' . $option;
+	}
+
+	/**
+	 * Write a value back exactly as given, bypassing any sanitize_option callback.
+	 * Restoring a backup must reproduce the old bytes — if a sanitize callback is what
+	 * corrupted the value, running the restore through it again would corrupt it too.
+	 */
+	private static function write_option_raw( $option, $value ) {
+		$force = static function () use ( $value ) { return $value; };
+		add_filter( "sanitize_option_{$option}", $force, PHP_INT_MAX );
+		self::silently( static function () use ( $option, $value ) { update_option( $option, $value ); } );
+		remove_filter( "sanitize_option_{$option}", $force, PHP_INT_MAX );
+	}
+
+	/** Push the current value onto the backup stack, newest first, keeping 5. */
+	private static function push_backup( $option, $value ) {
+		$key   = self::backup_key( $option );
+		$stack = get_option( $key, [] );
+		if ( ! is_array( $stack ) ) { $stack = []; }
+		array_unshift( $stack, [ 'at' => gmdate( 'c' ), 'value' => $value ] );
+		update_option( $key, array_slice( $stack, 0, 5 ), false );
+	}
+
+	/** GET /plugin-settings?option=…&keys=a,b — whole option when keys is omitted. */
+	public static function get_plugin_settings( WP_REST_Request $r ) {
+		$option = (string) $r->get_param( 'option' );
+		$check  = self::check_option_name( $option );
+		if ( is_wp_error( $check ) ) { return $check; }
+
+		$stored = get_option( $option, [] );
+		if ( ! is_array( $stored ) ) { $stored = []; }
+
+		$keys = array_values( array_filter( array_map( 'trim', explode( ',', (string) $r->get_param( 'keys' ) ) ) ) );
+		if ( ! $keys ) {
+			return [ 'ok' => true, 'option' => $option, 'values' => $stored ];
+		}
+
+		$out     = [];
+		$missing = [];
+		foreach ( $keys as $k ) {
+			if ( array_key_exists( $k, $stored ) ) { $out[ $k ] = $stored[ $k ]; } else { $missing[] = $k; }
+		}
+		return [ 'ok' => true, 'option' => $option, 'values' => $out, 'missing' => $missing ];
+	}
+
+	/**
+	 * POST /plugin-settings — body: { option, set:{…}, note? }
+	 * Partial update: merges into the stored array and saves the whole thing, so a sanitize
+	 * callback that blanks missing keys can't wipe the rest of the settings.
+	 */
+	public static function set_plugin_settings( WP_REST_Request $r ) {
+		$option = (string) $r->get_param( 'option' );
+		$check  = self::check_option_name( $option );
+		if ( is_wp_error( $check ) ) { return $check; }
+
+		$set = $r->get_param( 'set' );
+		if ( ! is_array( $set ) || ! $set ) { return new WP_Error( 'missing', 'set must be a non-empty object of key => value.', [ 'status' => 400 ] ); }
+
+		$stored = get_option( $option, [] );
+		if ( ! is_array( $stored ) ) { $stored = []; }
+
+		// Unknown keys are rejected outright — a typo must not silently add a dead setting.
+		$known   = self::known_keys( $option, $stored );
+		$unknown = array_values( array_diff( array_keys( $set ), $known ) );
+		if ( $unknown ) {
+			return new WP_Error( 'unknown_keys', 'Unknown setting key(s): ' . implode( ', ', $unknown ), [ 'status' => 400, 'unknown' => $unknown ] );
+		}
+
+		// Scalars only. JSON-bearing settings (imp_single_qs and friends) are strings and pass through as-is.
+		$bad = [];
+		foreach ( $set as $k => $v ) {
+			if ( ! is_scalar( $v ) && null !== $v ) { $bad[] = $k; }
+		}
+		if ( $bad ) {
+			return new WP_Error( 'bad_values', 'Values must be strings or numbers: ' . implode( ', ', $bad ), [ 'status' => 400 ] );
+		}
+
+		$set    = array_map( static function ( $v ) { return is_string( $v ) ? $v : ( is_bool( $v ) ? ( $v ? '1' : '0' ) : $v ); }, $set );
+		$merged = array_merge( $stored, $set );
+
+		self::push_backup( $option, $stored );
+		self::silently( static function () use ( $option, $merged ) { update_option( $option, $merged ); } );
+
+		// Read back: the plugin's sanitize callback may rewrite keys we never touched.
+		$after = get_option( $option, [] );
+		if ( ! is_array( $after ) ) { $after = []; }
+
+		$collateral = [];
+		foreach ( $stored as $k => $was ) {
+			if ( array_key_exists( $k, $set ) ) { continue; }
+			$now = $after[ $k ] ?? null;
+			if ( ( is_scalar( $was ) || null === $was ) && ( is_scalar( $now ) || null === $now ) ) {
+				if ( (string) $was !== (string) $now ) { $collateral[ $k ] = [ 'was' => $was, 'now' => $now ]; }
+			} elseif ( wp_json_encode( $was ) !== wp_json_encode( $now ) ) {
+				$collateral[ $k ] = [ 'was' => $was, 'now' => $now ];
+			}
+		}
+
+		if ( $collateral ) {
+			self::write_option_raw( $option, $stored );
+			return new WP_Error(
+				'collateral_change',
+				'Saving changed ' . count( $collateral ) . ' setting(s) that were not sent, so the previous values were restored. Likely the plugin\'s sanitize callback.',
+				[ 'status' => 409, 'changed_unexpectedly' => $collateral, 'restored' => true ]
+			);
+		}
+
+		$changed = [];
+		foreach ( $set as $k => $v ) {
+			$was = $stored[ $k ] ?? null;
+			$now = $after[ $k ] ?? null;
+			if ( wp_json_encode( $was ) !== wp_json_encode( $now ) ) { $changed[ $k ] = [ 'was' => $was, 'now' => $now ]; }
+		}
+
+		self::log_settings_change( $option, $r, $changed ? 'Updated ' . implode( ', ', array_keys( $changed ) ) : 'No values changed' );
+		return [ 'ok' => true, 'option' => $option, 'changed' => $changed, 'purged' => self::auto_purge( $r, [], false ) ];
+	}
+
+	/** POST /plugin-settings/restore — body: { option, note? } — puts back the newest backup. */
+	public static function restore_plugin_settings( WP_REST_Request $r ) {
+		$option = (string) $r->get_param( 'option' );
+		$check  = self::check_option_name( $option );
+		if ( is_wp_error( $check ) ) { return $check; }
+
+		$stack = get_option( self::backup_key( $option ), [] );
+		if ( ! is_array( $stack ) || ! $stack ) { return new WP_Error( 'no_backup', 'No backup stored for ' . $option, [ 'status' => 404 ] ); }
+
+		$entry   = array_shift( $stack );
+		$current = get_option( $option, [] );
+		self::write_option_raw( $option, $entry['value'] );
+		update_option( self::backup_key( $option ), $stack, false );
+
+		$after   = get_option( $option, [] );
+		$changed = [];
+		foreach ( (array) $after as $k => $v ) {
+			$was = is_array( $current ) ? ( $current[ $k ] ?? null ) : null;
+			if ( wp_json_encode( $was ) !== wp_json_encode( $v ) ) { $changed[ $k ] = [ 'was' => $was, 'now' => $v ]; }
+		}
+
+		self::log_settings_change( $option, $r, 'Restored backup from ' . ( $entry['at'] ?? 'unknown time' ) );
+		return [ 'ok' => true, 'option' => $option, 'restored_from' => $entry['at'] ?? null, 'changed' => $changed, 'backups_left' => count( $stack ), 'purged' => self::auto_purge( $r, [], false ) ];
+	}
+
+	/** Settings live in options, not posts, so log against the front page to keep one activity feed. */
+	private static function log_settings_change( $option, WP_REST_Request $r, $summary ) {
+		$note = sanitize_textarea_field( (string) $r->get_param( 'note' ) );
+		$id   = (int) get_option( 'page_on_front' );
+		$post = $id ? get_post( $id ) : null;
+		if ( ! $post ) {
+			$recent = get_posts( [ 'post_type' => 'page', 'post_status' => 'publish', 'numberposts' => 1, 'orderby' => 'modified', 'order' => 'DESC' ] );
+			$post   = $recent[0] ?? null;
+		}
+		if ( $post ) { self::queue( $post, 'edited', array_filter( [ "Plugin settings ({$option}): {$summary}", $note ] ) ); }
 	}
 
 	/* ─── cache purging ─── */
@@ -1453,6 +1643,9 @@ class Claude_Bridge {
 		<tr><td><code>POST /elementor/template/upsert</code></td><td>id?, title, type, status?, data_b64, page_settings?, conditions?</td><td>Create or update a Theme Builder template</td></tr>
 		<tr><td><code>POST /elementor/template/status</code></td><td>id, status</td><td>Publish or unpublish a template</td></tr>
 		<tr><td><code>POST /elementor/conditions</code></td><td>id, conditions:[…]</td><td>Set where a template displays</td></tr>
+		<tr><td><code>GET  /plugin-settings</code></td><td>option, keys? (comma list)</td><td>Read allowlisted plugin settings (cfg_*)</td></tr>
+		<tr><td><code>POST /plugin-settings</code></td><td>option, set:{…}, note?</td><td>Merge-update plugin settings; backs up first and rolls back if other keys change</td></tr>
+		<tr><td><code>POST /plugin-settings/restore</code></td><td>option, note?</td><td>Put back the previous settings (last 5 kept)</td></tr>
 		<tr><td><code>POST /option</code></td><td>key, value? (omit to read)</td><td>Read/write allowlisted site options (front page, WooCommerce pages)</td></tr>
 		<tr><td><code>GET  /wc/products</code></td><td>?search=&amp;limit=</td><td>Read product data (read-only — never writes prices)</td></tr>
 		<tr><td><code>GET  /cftg/entries</code></td><td>since?, status?, form?, limit?, offset?</td><td>Read CFT Group Forms entries (read-only)</td></tr>
