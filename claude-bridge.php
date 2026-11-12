@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.6.0
+ * Version:      1.7.0
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.6.0' );
+define( 'CB_VERSION', '1.7.0' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -52,6 +52,126 @@ class Claude_Bridge {
 		add_action( 'admin_bar_menu',    [ __CLASS__, 'admin_bar_button' ], 100 );
 		add_action( 'admin_post_cb_purge', [ __CLASS__, 'handle_purge_click' ] );
 		add_action( 'admin_notices',     [ __CLASS__, 'purge_notice' ] );
+
+		// Page guard — refuses saves that would break hand-built HTML pages (opt-in per page via /guard)
+		add_filter( 'update_post_metadata', [ __CLASS__, 'guard_meta' ], 10, 4 );
+		add_filter( 'add_post_metadata',    [ __CLASS__, 'guard_meta' ], 10, 4 );
+		add_filter( 'delete_post_metadata', [ __CLASS__, 'guard_delete' ], 10, 3 );
+		add_action( 'elementor/document/before_save', [ __CLASS__, 'guard_elementor' ], 10, 2 );
+		add_action( 'admin_notices',     [ __CLASS__, 'guard_notice' ] );
+	}
+
+	/* ─── page guard ─── */
+
+	const OPT_GUARD = 'claude_bridge_guarded_pages';   // [ page_id => marker ], empty unless set via POST /guard
+
+	private static function guard_marker( $id ) {
+		$g = get_option( self::OPT_GUARD, [] );
+		return ( is_array( $g ) && isset( $g[ (int) $id ] ) ) ? (string) $g[ (int) $id ] : null;
+	}
+
+	/** Why this layout would break the guarded page, or '' when it is safe to save. */
+	public static function guard_problem( $id, $layout ) {
+		$marker = self::guard_marker( $id );
+		$data   = is_string( $layout ) ? json_decode( $layout, true ) : $layout;
+		if ( ! is_array( $data ) ) { return 'the layout data is not valid JSON'; }
+		$found = false; $bad = '';
+		$walk = static function ( $els ) use ( &$walk, &$found, &$bad, $marker ) {
+			foreach ( (array) $els as $e ) {
+				if ( ! is_array( $e ) ) { continue; }
+				if ( ( $e['elType'] ?? '' ) === 'widget' ) {
+					$s = (array) ( $e['settings'] ?? [] );
+					if ( ( $e['widgetType'] ?? '' ) === 'html' ) {
+						$h = (string) ( $s['html'] ?? '' );
+						if ( preg_match( '#&lt;/?(a|span|button|div|section|p|li)\b#i', $h ) ) { $bad = 'the page code contains broken tags (e.g. &lt;/a&gt;)'; }
+						if ( '' === $marker || false !== stripos( $h, $marker ) ) { $found = true; }
+					} elseif ( ( $e['widgetType'] ?? '' ) === 'text-editor' ) {
+						$h = (string) ( $s['editor'] ?? '' );
+						if ( preg_match( '#<section\b|<adel\b|&lt;/#i', $h ) || ( $marker && false !== stripos( $h, $marker ) ) ) {
+							$bad = 'the page code was put in a Text Editor widget, which strips its links and buttons';
+						}
+					}
+				}
+				$walk( $e['elements'] ?? [] );
+			}
+		};
+		$walk( $data );
+		if ( $bad )    { return $bad; }
+		if ( ! $found ) { return 'the protected HTML widget was removed'; }
+		return '';
+	}
+
+	private static function guard_block( $id, $why ) {
+		$msg = 'Change blocked: “' . get_the_title( $id ) . '” is a protected page and ' . $why . '. Edit the text inside its HTML widget instead.';
+		if ( get_current_user_id() ) { set_transient( 'cb_guard_notice_' . get_current_user_id(), $msg, 300 ); }
+		self::queue( get_post( $id ), 'edited', [ $msg ] );
+		return $msg;
+	}
+
+	public static function guard_meta( $check, $id, $key, $value ) {
+		if ( null !== $check || null === self::guard_marker( $id ) ) { return $check; }
+		if ( '_elementor_data' === $key ) {
+			$why = self::guard_problem( $id, $value );
+			if ( $why ) { self::guard_block( $id, $why ); return false; }
+		}
+		if ( '_elementor_edit_mode' === $key && 'builder' !== $value ) {
+			self::guard_block( $id, 'it must stay in Elementor mode' );
+			return false;
+		}
+		return $check;
+	}
+
+	public static function guard_delete( $check, $id, $key ) {
+		if ( null !== $check || null === self::guard_marker( $id ) ) { return $check; }
+		if ( in_array( $key, [ '_elementor_data', '_elementor_edit_mode' ], true ) ) {
+			self::guard_block( $id, 'it must stay in Elementor mode' );
+			return false;
+		}
+		return $check;
+	}
+
+	/** Stops the save inside the Elementor editor too, so the editor shows why instead of "saved". */
+	public static function guard_elementor( $document, $data ) {
+		if ( ! method_exists( $document, 'get_main_id' ) || ! isset( $data['elements'] ) ) { return; }
+		$id = $document->get_main_id();
+		if ( null === self::guard_marker( $id ) ) { return; }
+		$why = self::guard_problem( $id, $data['elements'] );
+		if ( $why ) { throw new \Exception( esc_html( self::guard_block( $id, $why ) ) ); }
+	}
+
+	public static function guard_notice() {
+		$key = 'cb_guard_notice_' . get_current_user_id();
+		$msg = get_transient( $key );
+		if ( ! $msg ) { return; }
+		delete_transient( $key );
+		echo '<div class="notice notice-error"><p>' . esc_html( $msg ) . '</p></div>';
+	}
+
+	/** GET /guard — guarded pages and whether their saved layout is healthy. */
+	public static function guard_list() {
+		$out = [];
+		foreach ( (array) get_option( self::OPT_GUARD, [] ) as $id => $marker ) {
+			$out[] = [
+				'id'      => (int) $id,
+				'title'   => get_the_title( $id ),
+				'link'    => get_permalink( $id ),
+				'marker'  => $marker,
+				'mode'    => get_post_meta( $id, '_elementor_edit_mode', true ),
+				'problem' => self::guard_problem( $id, get_post_meta( $id, '_elementor_data', true ) ) ?: null,
+			];
+		}
+		return $out;
+	}
+
+	/** POST /guard — body: { add: { "<id>": "<marker the HTML widget must contain>" }, remove: [ids] } */
+	public static function guard_save( WP_REST_Request $r ) {
+		$g = (array) get_option( self::OPT_GUARD, [] );
+		foreach ( (array) $r->get_param( 'remove' ) as $id ) { unset( $g[ (int) $id ] ); }
+		foreach ( (array) $r->get_param( 'add' ) as $id => $marker ) {
+			if ( get_post( (int) $id ) ) { $g[ (int) $id ] = sanitize_text_field( (string) $marker ); }
+		}
+		update_option( self::OPT_GUARD, $g, false );
+		return [ 'ok' => true, 'guarded' => self::guard_list() ];
 	}
 
 	/* ─── purge button ─── */
@@ -220,7 +340,9 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/cftg/entries',      [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'cftg_entries' ] ] );
 		register_rest_route( CB_NS, '/purge',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'purge_endpoint' ] ] );
 		register_rest_route( CB_NS, '/cache/flush',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'flush_caches' ] ] );
-		register_rest_route( CB_NS, '/self-update',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
+		register_rest_route( CB_NS, '/guard',             [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_list' ] ] );
+		register_rest_route( CB_NS, '/guard',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_save' ] ] );
+		register_rest_route( CB_NS, '/self-update',      [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
 	}
 
 	/* ─── handlers ─── */
