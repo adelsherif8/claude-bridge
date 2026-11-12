@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.7.0
+ * Version:      1.7.1
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.7.0' );
+define( 'CB_VERSION', '1.7.1' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -168,7 +168,8 @@ class Claude_Bridge {
 		$g = (array) get_option( self::OPT_GUARD, [] );
 		foreach ( (array) $r->get_param( 'remove' ) as $id ) { unset( $g[ (int) $id ] ); }
 		foreach ( (array) $r->get_param( 'add' ) as $id => $marker ) {
-			if ( get_post( (int) $id ) ) { $g[ (int) $id ] = sanitize_text_field( (string) $marker ); }
+			// Raw text on purpose: markers like "<adel" are only matched with stripos, never printed.
+			if ( get_post( (int) $id ) ) { $g[ (int) $id ] = substr( trim( (string) $marker ), 0, 100 ); }
 		}
 		update_option( self::OPT_GUARD, $g, false );
 		return [ 'ok' => true, 'guarded' => self::guard_list() ];
