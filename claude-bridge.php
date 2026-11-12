@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.7.1
+ * Version:      1.7.2
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.7.1' );
+define( 'CB_VERSION', '1.7.2' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -108,13 +108,41 @@ class Claude_Bridge {
 		return $msg;
 	}
 
+	const OPT_GUARD_LOG = 'claude_bridge_guard_log';   // last 100 write attempts on guarded pages
+
+	/** Records who/what tried to write a guarded page — user, request type, URL and the calling plugin/theme file. */
+	private static function guard_log( $id, $key, $result, $why = '' ) {
+		$caller = '';
+		foreach ( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 40 ) as $f ) {
+			$file = $f['file'] ?? '';
+			if ( $file && false === strpos( $file, 'claude-bridge' ) && preg_match( '#/wp-content/((?:plugins|themes|mu-plugins)/[^/]+)#', $file, $m ) ) { $caller = $m[1] . ' (' . basename( $file ) . ':' . ( $f['line'] ?? 0 ) . ')'; break; }
+		}
+		$user = wp_get_current_user();
+		$log  = (array) get_option( self::OPT_GUARD_LOG, [] );
+		array_unshift( $log, [
+			'time'    => current_time( 'mysql' ),
+			'page'    => (int) $id,
+			'key'     => $key,
+			'result'  => $result,
+			'why'     => $why,
+			'user'    => $user && $user->ID ? $user->user_login : '(nobody logged in)',
+			'context' => wp_doing_cron() ? 'cron' : ( wp_doing_ajax() ? 'ajax:' . sanitize_key( $_REQUEST['action'] ?? '' ) : ( defined( 'REST_REQUEST' ) && REST_REQUEST ? 'rest' : ( defined( 'WP_CLI' ) && WP_CLI ? 'wp-cli' : 'web' ) ) ),
+			'url'     => substr( (string) ( $_SERVER['REQUEST_URI'] ?? '' ), 0, 200 ),
+			'agent'   => substr( (string) ( $_SERVER['HTTP_USER_AGENT'] ?? '' ), 0, 120 ),
+			'caller'  => $caller ?: 'wordpress core / elementor',
+		] );
+		update_option( self::OPT_GUARD_LOG, array_slice( $log, 0, 100 ), false );
+	}
+
 	public static function guard_meta( $check, $id, $key, $value ) {
 		if ( null !== $check || null === self::guard_marker( $id ) ) { return $check; }
 		if ( '_elementor_data' === $key ) {
 			$why = self::guard_problem( $id, $value );
+			self::guard_log( $id, $key, $why ? 'blocked' : 'allowed', $why );
 			if ( $why ) { self::guard_block( $id, $why ); return false; }
 		}
 		if ( '_elementor_edit_mode' === $key && 'builder' !== $value ) {
+			self::guard_log( $id, $key, 'blocked', 'set to "' . (string) $value . '"' );
 			self::guard_block( $id, 'it must stay in Elementor mode' );
 			return false;
 		}
@@ -124,10 +152,42 @@ class Claude_Bridge {
 	public static function guard_delete( $check, $id, $key ) {
 		if ( null !== $check || null === self::guard_marker( $id ) ) { return $check; }
 		if ( in_array( $key, [ '_elementor_data', '_elementor_edit_mode' ], true ) ) {
+			self::guard_log( $id, $key, 'blocked', 'delete' );
 			self::guard_block( $id, 'it must stay in Elementor mode' );
 			return false;
 		}
 		return $check;
+	}
+
+	/** GET /guard/log — recent write attempts on guarded pages. */
+	public static function guard_log_list() {
+		return (array) get_option( self::OPT_GUARD_LOG, [] );
+	}
+
+	/** GET /history/{id} — the page's revisions: when, who, and whether each saved layout was broken. Read-only. */
+	public static function page_history( WP_REST_Request $r ) {
+		$id = (int) $r['id'];
+		$p  = get_post( $id );
+		if ( ! $p ) { return new WP_Error( 'not_found', 'Not found.', [ 'status' => 404 ] ); }
+		$row = static function ( WP_Post $x ) {
+			$data = get_post_meta( $x->ID, '_elementor_data', true );
+			$data = is_string( $data ) ? $data : wp_json_encode( $data );
+			$a    = get_userdata( (int) $x->post_author );
+			return [
+				'id'          => $x->ID,
+				'type'        => $x->post_type,
+				'name'        => $x->post_name,
+				'modified'    => $x->post_modified,
+				'author'      => $a ? $a->user_login : '(none)',
+				'layout_size' => strlen( (string) $data ),
+				'layout_md5'  => $data ? md5( $data ) : '',
+				'text_editor' => (bool) preg_match( '#"widgetType":"text-editor"#', (string) $data ),
+				'escaped'     => preg_match_all( '#&lt;/(a|span|button)#', (string) $data ),
+				'content_escaped' => preg_match_all( '#&lt;/(a|span|button)#', $x->post_content ),
+			];
+		};
+		$revs = wp_get_post_revisions( $id, [ 'posts_per_page' => (int) ( $r->get_param( 'limit' ) ?: 100 ) ] );
+		return [ 'page' => $row( $p ), 'edit_lock' => get_post_meta( $id, '_edit_lock', true ), 'edit_last' => ( $u = get_userdata( (int) get_post_meta( $id, '_edit_last', true ) ) ) ? $u->user_login : '', 'revisions' => array_values( array_map( $row, $revs ) ) ];
 	}
 
 	/** Stops the save inside the Elementor editor too, so the editor shows why instead of "saved". */
@@ -343,6 +403,8 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/cache/flush',       [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'flush_caches' ] ] );
 		register_rest_route( CB_NS, '/guard',             [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_list' ] ] );
 		register_rest_route( CB_NS, '/guard',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_save' ] ] );
+		register_rest_route( CB_NS, '/guard/log',         [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_log_list' ] ] );
+		register_rest_route( CB_NS, '/history/(?P<id>\d+)', [ 'methods' => 'GET', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'page_history' ] ] );
 		register_rest_route( CB_NS, '/self-update',      [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
 	}
 
