@@ -3,7 +3,7 @@
  * Plugin Name:  Claude Bridge
  * Plugin URI:   https://adelatya.com
  * Description:  REST API bridge for Claude Code. Token-only or Token+AppPass auth, WAF-safe base64 content, private automatic updates.
- * Version:      1.7.2
+ * Version:      1.8.0
  * Author:       Adel Emad
  * Author URI:   https://adelatya.com
  * License:      GPLv2 or later
@@ -12,7 +12,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'CB_VERSION', '1.7.2' );
+define( 'CB_VERSION', '1.8.0' );
 define( 'CB_NS',      'claude/v1' );
 define( 'CB_FILE',    __FILE__ );
 
@@ -1652,14 +1652,21 @@ class Claude_Bridge {
 		}
 		$data = json_decode( wp_remote_retrieve_body( $resp ), true );
 		if ( empty( $data['version'] ) || empty( $data['package'] ) ) { return null; }
-		// Package links are signed for 1 hour, so don't cache longer than that.
-		set_transient( 'cb_release', $data, 30 * MINUTE_IN_SECONDS );
+		// Package links are signed for 7 days, so a long cache never holds a dead link.
+		// Caching for 12h instead of 30min cuts update-server calls ~24x per site.
+		// The server may suggest its own TTL via cache_seconds; clamp it to 1h–24h.
+		$ttl = 12 * HOUR_IN_SECONDS;
+		if ( ! empty( $data['cache_seconds'] ) && is_numeric( $data['cache_seconds'] ) ) {
+			$ttl = min( DAY_IN_SECONDS, max( HOUR_IN_SECONDS, (int) $data['cache_seconds'] ) );
+		}
+		set_transient( 'cb_release', $data, $ttl );
 		return $data;
 	}
 
 	public static function check_update( $transient ) {
 		if ( empty( $transient->checked ) ) { return $transient; }
-		$release = self::release();
+		// "Check again" on the Updates screen must bypass the 12h cache.
+		$release = self::release( self::forcing_check() );
 		if ( ! $release ) { return $transient; }
 		$slug = plugin_basename( CB_FILE );
 		$item = (object) [
@@ -1676,6 +1683,11 @@ class Claude_Bridge {
 			$transient->no_update[ $slug ] = $item;
 		}
 		return $transient;
+	}
+
+	/** True when the admin clicked "Check again" (update-core.php?force-check=1). */
+	private static function forcing_check() {
+		return ! empty( $_GET['force-check'] ) && is_admin(); // phpcs:ignore WordPress.Security.NonceVerification
 	}
 
 	public static function plugin_info( $result, $action, $args ) {
