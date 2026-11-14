@@ -912,14 +912,18 @@ class Claude_Bridge {
 	/* ─── analytics (read-only, aggregated on the site, no customer data) ─── */
 
 	/**
-	 * The three form plugins, each with its own tables. A site normally runs one.
-	 * 'form_col' => the events table has a form_type column to split by.
+	 * The three form plugins, each with its own tables and naming. A site normally runs one.
+	 *  event    — column holding the event name
+	 *  done     — event name(s) meaning the form was submitted
+	 *  step     — column identifying a step; step_num holds an integer
+	 *  form_col — the events table has a form_type column to split by
+	 *  landing  — page id lives in step_key on 'landing' rows (dental, before page_id existed)
 	 */
 	private static function analytics_sources() {
 		return [
-			'dental'       => [ 'label' => 'Contact Form + GHL', 'events' => 'cfg_events',  'entries' => 'cfg_entries',  'form_col' => true  ],
-			'autoshippers' => [ 'label' => 'Autoshippers Forms', 'events' => 'as_events',   'entries' => 'as_entries',   'form_col' => false ],
-			'cftgroup'     => [ 'label' => 'CFT Group Forms',    'events' => 'cftg_events', 'entries' => 'cftg_entries', 'form_col' => true  ],
+			'dental'       => [ 'label' => 'Contact Form + GHL', 'events' => 'cfg_events',  'entries' => 'cfg_entries',  'event' => 'event_type', 'done' => [ 'complete' ], 'step' => 'step_key', 'form_col' => true,  'landing' => true  ],
+			'autoshippers' => [ 'label' => 'Autoshippers Forms', 'events' => 'as_events',   'entries' => 'as_entries',   'event' => 'event_type', 'done' => [ 'complete' ], 'step' => 'step_key', 'form_col' => false, 'landing' => false ],
+			'cftgroup'     => [ 'label' => 'CFT Group Forms',    'events' => 'cftg_funnel', 'entries' => 'cftg_entries', 'event' => 'event',      'done' => [ 'submit' ],   'step' => 'step_num', 'form_col' => true,  'landing' => false ],
 		];
 	}
 
@@ -938,13 +942,14 @@ class Claude_Bridge {
 	 * Falls back to the dental plugin's habit of putting the page id in step_key on
 	 * 'landing' events, so per-page numbers work before call tracking ships.
 	 */
-	private static function page_expr( $table, $alias = '' ) {
+	private static function page_expr( $table, array $cfg, $alias = '' ) {
 		$a     = $alias ? $alias . '.' : '';
 		$parts = [];
 		if ( self::column_exists( $table, 'page_id' ) )  { $parts[] = "CASE WHEN {$a}page_id > 0 THEN CAST({$a}page_id AS CHAR) END"; }
 		if ( self::column_exists( $table, 'page_url' ) ) { $parts[] = "NULLIF({$a}page_url, '')"; }
-		// Dental plugin before call-tracking shipped: the page id lives in step_key on 'landing'.
-		$parts[] = "CASE WHEN {$a}event_type = 'landing' AND CAST({$a}step_key AS UNSIGNED) > 0 THEN {$a}step_key END";
+		// Dental plugin before page_id existed: the page id lives in step_key on 'landing'.
+		if ( $cfg['landing'] ) { $parts[] = "CASE WHEN {$a}{$cfg['event']} = 'landing' AND CAST({$a}step_key AS UNSIGNED) > 0 THEN {$a}step_key END"; }
+		if ( ! $parts ) { return "''"; }
 		return 'COALESCE(' . implode( ', ', $parts ) . ", '')";
 	}
 
@@ -986,9 +991,14 @@ class Claude_Bridge {
 			if ( $has_ev ) {
 				$has_form = $cfg['form_col'] && self::column_exists( $events, 'form_type' );
 				$formsel  = $has_form ? 'form_type' : "''";
-				$page     = self::page_expr( $events );
-				$page_pe  = self::page_expr( $events, 'pe' );
+				$page     = self::page_expr( $events, $cfg );
+				$page_pe  = self::page_expr( $events, $cfg, 'pe' );
 				$form_pe  = $has_form ? 'pe.form_type' : "''";
+				$evc      = $cfg['event'];   // event_type | event — fixed names from config, never input
+				$stc      = $cfg['step'];    // step_key | step_num
+				$done     = "'" . implode( "','", array_map( 'esc_sql', $cfg['done'] ) ) . "'";
+				$has_step = self::column_exists( $events, $stc );
+				$step_set = 'step_num' === $stc ? "{$stc} > 0" : "{$stc} <> ''";
 
 				// Attribute each session to the first page it was seen on, then count the
 				// whole journey against that page.
@@ -996,11 +1006,11 @@ class Claude_Bridge {
 				// Plain joins only — this has to run the same on every client's MySQL.
 				$sql = "
 					SELECT s.page, s.form_type,
-						COUNT(DISTINCT CASE WHEN ev.event_type IN ('view','landing') THEN ev.session_id END) AS views,
-						COUNT(DISTINCT CASE WHEN ev.event_type = 'start'    THEN ev.session_id END) AS starts,
-						COUNT(DISTINCT CASE WHEN ev.event_type = 'complete' THEN ev.session_id END) AS form_fills,
-						COUNT(CASE WHEN ev.event_type = 'call' THEN 1 END)                          AS calls,
-						COUNT(DISTINCT CASE WHEN ev.event_type = 'call' THEN ev.session_id END)     AS call_sessions
+						COUNT(DISTINCT CASE WHEN ev.{$evc} IN ('view','landing') THEN ev.session_id END) AS views,
+						COUNT(DISTINCT CASE WHEN ev.{$evc} = 'start'        THEN ev.session_id END) AS starts,
+						COUNT(DISTINCT CASE WHEN ev.{$evc} IN ({$done})     THEN ev.session_id END) AS form_fills,
+						COUNT(CASE WHEN ev.{$evc} = 'call' THEN 1 END)                              AS calls,
+						COUNT(DISTINCT CASE WHEN ev.{$evc} = 'call' THEN ev.session_id END)         AS call_sessions
 					FROM (
 						SELECT f.session_id, {$page_pe} AS page, {$form_pe} AS form_type
 						FROM (
@@ -1016,7 +1026,9 @@ class Claude_Bridge {
 					ORDER BY views DESC";
 				$rows = $wpdb->get_results( $wpdb->prepare( $sql, $since, $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
 
-				$t = [ 'views' => 0, 'form_fills' => 0, 'calls' => 0 ];
+				// Taps on pages with no form views (contact page, header phone number) are real
+				// calls but have no denominator, so they're counted apart from the rate.
+				$t = [ 'views' => 0, 'form_fills' => 0, 'calls' => 0, 'call_sessions' => 0, 'calls_only_taps' => 0, 'calls_only_sessions' => 0 ];
 				foreach ( (array) $rows as $row ) {
 					$views  = (int) $row['views'];
 					$fills  = (int) $row['form_fills'];
@@ -1034,40 +1046,50 @@ class Claude_Bridge {
 						'conv_form_pct'  => $views > 0 ? round( $fills / $views * 100, 1 ) : null,
 						'conv_call_pct'  => $views > 0 ? round( $csess / $views * 100, 1 ) : null,
 					] );
-					$t['views'] += $views; $t['form_fills'] += $fills; $t['calls'] += $calls;
+					$t['calls'] += $calls;
+					if ( $views > 0 ) {
+						$t['views'] += $views; $t['form_fills'] += $fills; $t['call_sessions'] += $csess;
+					} else {
+						$t['calls_only_taps'] += $calls; $t['calls_only_sessions'] += $csess;
+					}
 					if ( $calls > 0 ) { $src['tracks_calls'] = true; }
 				}
-				$t['conv_total_pct'] = $t['views'] > 0 ? round( ( $t['form_fills'] + $t['calls'] ) / $t['views'] * 100, 1 ) : null;
+				$t['conv_total_pct'] = $t['views'] > 0 ? round( ( $t['form_fills'] + $t['call_sessions'] ) / $t['views'] * 100, 1 ) : null;
 				$t['conv_form_pct']  = $t['views'] > 0 ? round( $t['form_fills'] / $t['views'] * 100, 1 ) : null;
+				$t['conv_call_pct']  = $t['views'] > 0 ? round( $t['call_sessions'] / $t['views'] * 100, 1 ) : null;
 				$src['totals'] = $t;
 
-				// Where people stop: the last step of sessions that never completed.
-				$steps = $wpdb->get_results( $wpdb->prepare( "
-					SELECT {$formsel} AS form_type, step_key,
-						COUNT(DISTINCT session_id) AS reached
-					FROM `{$events}`
-					WHERE event_type = 'step' AND created_at >= %s AND step_key <> ''
-					GROUP BY form_type, step_key ORDER BY reached DESC LIMIT 60", $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
-				$last_form = $has_form ? 'le.form_type' : "''";
-				$drops = $wpdb->get_results( $wpdb->prepare( "
-					SELECT {$last_form} AS form_type, le.step_key, COUNT(*) AS drop_offs
-					FROM (
-						SELECT session_id, MAX(id) AS last_id
+				// Where people stop: the last step of sessions that never submitted.
+				$steps = $drops = [];
+				if ( $has_step ) {
+					$steps = $wpdb->get_results( $wpdb->prepare( "
+						SELECT {$formsel} AS form_type, {$stc} AS step,
+							COUNT(DISTINCT session_id) AS reached
 						FROM `{$events}`
-						WHERE event_type = 'step' AND created_at >= %s
-							AND session_id NOT IN (SELECT session_id FROM `{$events}` WHERE event_type = 'complete' AND created_at >= %s)
-						GROUP BY session_id
-					) ls
-					JOIN `{$events}` le ON le.id = ls.last_id
-					GROUP BY form_type, le.step_key ORDER BY drop_offs DESC LIMIT 60", $since, $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+						WHERE {$evc} = 'step' AND created_at >= %s AND {$step_set}
+						GROUP BY form_type, step ORDER BY reached DESC LIMIT 60", $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+					$last_form = $has_form ? 'le.form_type' : "''";
+					$drops = $wpdb->get_results( $wpdb->prepare( "
+						SELECT {$last_form} AS form_type, le.{$stc} AS step, COUNT(*) AS drop_offs
+						FROM (
+							SELECT session_id, MAX(id) AS last_id
+							FROM `{$events}`
+							WHERE {$evc} = 'step' AND created_at >= %s
+								AND session_id NOT IN (SELECT session_id FROM `{$events}` WHERE {$evc} IN ({$done}) AND created_at >= %s)
+							GROUP BY session_id
+						) ls
+						JOIN `{$events}` le ON le.id = ls.last_id
+						GROUP BY form_type, step ORDER BY drop_offs DESC LIMIT 60", $since, $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+				}
 				$dropmap = [];
-				foreach ( (array) $drops as $d ) { $dropmap[ $d['form_type'] . '|' . $d['step_key'] ] = (int) $d['drop_offs']; }
+				foreach ( (array) $drops as $d ) { $dropmap[ $d['form_type'] . '|' . $d['step'] ] = (int) $d['drop_offs']; }
 				foreach ( (array) $steps as $st ) {
 					$src['steps'][] = [
 						'form_type' => $st['form_type'] ?: null,
-						'step'      => $st['step_key'],
+						// CFT numbers its steps; the other plugins name them.
+						'step'      => 'step_num' === $stc ? 'Step ' . (int) $st['step'] : $st['step'],
 						'reached'   => (int) $st['reached'],
-						'drop_offs' => $dropmap[ $st['form_type'] . '|' . $st['step_key'] ] ?? 0,
+						'drop_offs' => $dropmap[ $st['form_type'] . '|' . $st['step'] ] ?? 0,
 					];
 				}
 			}
