@@ -428,6 +428,34 @@ class Claude_Bridge {
 			'home'    => home_url(),
 			'wp'      => get_bloginfo( 'version' ),
 			'mode'    => get_option( self::OPT_MODE, 'token_only' ),
+			'updates' => self::update_diagnostics(),
+		];
+	}
+
+	/** Why WordPress might not offer our update: is it in the list, and what hooks into that list. */
+	private static function update_diagnostics() {
+		global $wp_filter;
+		$slug  = plugin_basename( CB_FILE );
+		$t     = get_site_transient( 'update_plugins' );
+		$names = static function ( $hook ) use ( $wp_filter ) {
+			$out = [];
+			if ( empty( $wp_filter[ $hook ] ) ) { return $out; }
+			foreach ( $wp_filter[ $hook ]->callbacks as $prio => $cbs ) {
+				foreach ( $cbs as $cb ) {
+					$f = $cb['function'];
+					$n = is_string( $f ) ? $f : ( is_array( $f ) ? ( is_object( $f[0] ) ? get_class( $f[0] ) : $f[0] ) . '::' . $f[1] : 'closure' );
+					if ( $f instanceof Closure ) { $r = new ReflectionFunction( $f ); $n = 'closure@' . basename( dirname( (string) $r->getFileName() ) ) . '/' . basename( (string) $r->getFileName() ); }
+					$out[] = $prio . ' ' . $n;
+				}
+			}
+			return $out;
+		};
+		return [
+			'in_list'      => is_object( $t ) && ! empty( $t->response[ $slug ] ),
+			'listed_as'    => is_object( $t ) ? ( isset( $t->response[ $slug ] ) ? 'update' : ( isset( $t->no_update[ $slug ] ) ? 'no_update' : 'missing' ) ) : 'no list',
+			'last_checked' => is_object( $t ) && ! empty( $t->last_checked ) ? gmdate( 'c', (int) $t->last_checked ) : null,
+			'filters'      => array_merge( $names( 'site_transient_update_plugins' ), $names( 'pre_site_transient_update_plugins' ), $names( 'auto_update_plugin' ) ),
+			'automatic_updater_disabled' => (bool) apply_filters( 'automatic_updater_disabled', defined( 'AUTOMATIC_UPDATER_DISABLED' ) && AUTOMATIC_UPDATER_DISABLED ),
 		];
 	}
 
@@ -2566,11 +2594,31 @@ class Claude_Bridge {
 			set_site_transient( 'update_plugins', $t );
 		}
 		$upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
-		$res      = $upgrader->upgrade( plugin_basename( CB_FILE ) );
+		$res      = $upgrader->upgrade( $slug );
+		$method   = 'update';
 		if ( is_wp_error( $res ) || ! $res ) {
-			return new WP_Error( 'update_failed', is_wp_error( $res ) ? $res->get_error_message() : 'Upgrade failed.', [ 'status' => 500, 'log' => $upgrader->skin->get_upgrade_messages() ] );
+			// Something on this site keeps us out of WordPress's update list (a security or
+			// update-manager plugin, a filter…), so the normal update says "latest". Install the
+			// new package straight from our update server instead — same files, same folder.
+			$log      = $upgrader->skin->get_upgrade_messages();
+			$upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
+			$upgrader->init();
+			$upgrader->upgrade_strings();
+			$res = $upgrader->run( [
+				'package'           => $release['package'],
+				'destination'       => WP_PLUGIN_DIR,
+				'clear_destination' => true,
+				'clear_working'     => true,
+				'hook_extra'        => [ 'plugin' => $slug, 'type' => 'plugin', 'action' => 'update' ],
+			] );
+			$method = 'direct';
+			if ( is_wp_error( $res ) || ! $res ) {
+				return new WP_Error( 'update_failed', is_wp_error( $res ) ? $res->get_error_message() : 'Upgrade failed.', [ 'status' => 500, 'log' => array_merge( (array) $log, (array) $upgrader->skin->get_upgrade_messages() ) ] );
+			}
+			if ( ! is_plugin_active( $slug ) ) { activate_plugin( $slug ); }
 		}
-		return [ 'ok' => true, 'updated' => true, 'from' => CB_VERSION, 'to' => $release['version'] ];
+		wp_clean_plugins_cache( true );
+		return [ 'ok' => true, 'updated' => true, 'from' => CB_VERSION, 'to' => $release['version'], 'method' => $method ];
 	}
 
 	/** Daily: install a newer Claude Bridge if there is one. Never throws. */
@@ -2592,6 +2640,16 @@ class Claude_Bridge {
 	}
 
 	public static function admin_page() {
+		if ( isset( $_POST['cb_update_now'] ) && check_admin_referer( 'cb_update_now' ) && current_user_can( 'update_plugins' ) ) {
+			$res = self::self_update();
+			if ( is_wp_error( $res ) ) {
+				echo '<div class="notice notice-error"><p>Update failed: ' . esc_html( $res->get_error_message() ) . '</p></div>';
+			} elseif ( ! empty( $res['updated'] ) ) {
+				echo '<div class="notice notice-success"><p>Updated to v' . esc_html( $res['to'] ) . '. <a href="">Reload this page</a> to see it.</p></div>';
+			} else {
+				echo '<div class="notice notice-info"><p>Already on the latest version.</p></div>';
+			}
+		}
 		if ( isset( $_POST['cb_regen'] ) && check_admin_referer( 'cb_regen' ) ) {
 			update_option( self::OPT_TOKEN, wp_generate_password( 40, false, false ), false );
 			echo '<div class="notice notice-success"><p>Token regenerated.</p></div>';
@@ -2609,9 +2667,15 @@ class Claude_Bridge {
 			Claude Bridge
 			<span style="font-size:13px;color:#666;font-weight:400"> v<?php echo CB_VERSION; ?></span>
 			<?php if ( $has_upd ) : ?>
-				<span style="font-size:13px;color:#d63638;font-weight:400"> — Update available: v<?php echo esc_html( $latest ); ?> — installs automatically</span>
+				<span style="font-size:13px;color:#d63638;font-weight:400"> — Update available: v<?php echo esc_html( $latest ); ?></span>
 			<?php endif; ?>
 		</h1>
+		<?php if ( $has_upd && current_user_can( 'update_plugins' ) ) : ?>
+			<form method="post" style="margin:8px 0 14px"><?php wp_nonce_field( 'cb_update_now' ); ?>
+				<button class="button button-primary" name="cb_update_now" value="1">Update now to v<?php echo esc_html( $latest ); ?></button>
+				<span style="color:#666;margin-left:8px">It also installs itself within a day.</span>
+			</form>
+		<?php endif; ?>
 
 		<table class="form-table" style="max-width:820px">
 		<tr><th style="width:160px">Cache</th><td>

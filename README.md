@@ -15,6 +15,12 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.11.3
+- When the normal update reports "latest" because something on the site keeps Claude Bridge
+  out of WordPress's update list, it installs the new version directly from the update server.
+- "Update now" button on Tools → Claude Bridge whenever a newer version exists.
+- `/ping` reports whether our update is in WordPress's list and which code filters that list.
+
 ### 1.11.2
 - Reads the sites that use our own form code instead of a form plugin: CFT Storage
   (`cft_lead` posts + `cft_form_events`) and PackOnce (`po_lead` posts + `po_form_events`).
