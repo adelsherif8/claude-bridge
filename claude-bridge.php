@@ -953,6 +953,28 @@ class Claude_Bridge {
 		return 'COALESCE(' . implode( ', ', $parts ) . ", '')";
 	}
 
+	/**
+	 * One identity per page. Older events stored only a URL, newer ones a post id, so the
+	 * same page can arrive under both — normalise both to the page's path.
+	 */
+	private static function canonical_page( $key ) {
+		$key = (string) $key;
+		if ( '' === $key ) { return [ 'path' => '', 'page_id' => 0 ]; }
+		if ( ctype_digit( $key ) ) {
+			$id   = (int) $key;
+			$link = get_permalink( $id );
+			$path = $link ? wp_parse_url( $link, PHP_URL_PATH ) : "#{$id}";
+		} else {
+			$path = wp_parse_url( $key, PHP_URL_PATH );
+			$id   = 0;
+		}
+		$path = '/' . trim( strtolower( (string) ( $path ?: '/' ) ), '/' );
+		if ( ! $id && '#' !== substr( $path, 0, 1 ) ) {
+			$id = '/' === $path ? (int) get_option( 'page_on_front' ) : (int) url_to_postid( home_url( $path ) );
+		}
+		return [ 'path' => $path, 'page_id' => $id ];
+	}
+
 	/** Turn a page key (post id or url) into something readable, without extra queries per row. */
 	private static function describe_page( $key ) {
 		if ( '' === $key ) { return [ 'page' => '', 'title' => '(not attributed)', 'url' => '' ]; }
@@ -961,7 +983,8 @@ class Claude_Bridge {
 			return [ 'page' => $key, 'page_id' => $id, 'title' => get_the_title( $id ) ?: "#{$id}", 'url' => get_permalink( $id ) ?: '' ];
 		}
 		$path = wp_parse_url( $key, PHP_URL_PATH );
-		return [ 'page' => $key, 'title' => $path ?: $key, 'url' => $key ];
+		$path = ( ! $path || '/' === $path ) ? 'Home' : $path;
+		return [ 'page' => $key, 'title' => $path, 'url' => $key ];
 	}
 
 	/** GET /analytics/funnel?days=30 — per-page views, form fills, calls and conversion. */
@@ -1000,10 +1023,10 @@ class Claude_Bridge {
 				$has_step = self::column_exists( $events, $stc );
 				$step_set = 'step_num' === $stc ? "{$stc} > 0" : "{$stc} <> ''";
 
-				// Attribute each session to the first page it was seen on, then count the
-				// whole journey against that page.
-				// Attribute each session to the first page-bearing event it produced, by id.
+				// Attribute each session to the first event that carries a page. Sessions with
+				// no page at all (older events) are kept under an empty page, not dropped.
 				// Plain joins only — this has to run the same on every client's MySQL.
+				$form_fe = $has_form ? "COALESCE(NULLIF(pe.form_type, ''), fe.form_type, '')" : "''";
 				$sql = "
 					SELECT s.page, s.form_type,
 						COUNT(DISTINCT CASE WHEN ev.{$evc} IN ('view','landing') THEN ev.session_id END) AS views,
@@ -1012,14 +1035,17 @@ class Claude_Bridge {
 						COUNT(CASE WHEN ev.{$evc} = 'call' THEN 1 END)                              AS calls,
 						COUNT(DISTINCT CASE WHEN ev.{$evc} = 'call' THEN ev.session_id END)         AS call_sessions
 					FROM (
-						SELECT f.session_id, {$page_pe} AS page, {$form_pe} AS form_type
+						SELECT f.session_id, {$page_pe} AS page, {$form_fe} AS form_type
 						FROM (
-							SELECT session_id, MIN(id) AS first_id
+							SELECT session_id,
+								MIN(CASE WHEN {$page} <> '' THEN id END) AS first_page_id,
+								MIN(id) AS first_id
 							FROM `{$events}`
-							WHERE created_at >= %s AND session_id <> '' AND {$page} <> ''
+							WHERE created_at >= %s AND session_id <> ''
 							GROUP BY session_id
 						) f
-						JOIN `{$events}` pe ON pe.id = f.first_id
+						LEFT JOIN `{$events}` pe ON pe.id = f.first_page_id
+						LEFT JOIN `{$events}` fe ON fe.id = f.first_id
 					) s
 					JOIN `{$events}` ev ON ev.session_id = s.session_id AND ev.created_at >= %s
 					GROUP BY s.page, s.form_type
@@ -1028,14 +1054,30 @@ class Claude_Bridge {
 
 				// Taps on pages with no form views (contact page, header phone number) are real
 				// calls but have no denominator, so they're counted apart from the rate.
-				$t = [ 'views' => 0, 'form_fills' => 0, 'calls' => 0, 'call_sessions' => 0, 'calls_only_taps' => 0, 'calls_only_sessions' => 0 ];
+				// Each session sits in exactly one row, so rows for the same page can be summed.
+				$merged = [];
 				foreach ( (array) $rows as $row ) {
+					$c    = self::canonical_page( $row['page'] );
+					$mkey = $c['path'] . '|' . $row['form_type'];   // not $key: that's the plugin name
+					if ( ! isset( $merged[ $mkey ] ) ) {
+						$merged[ $mkey ] = [ 'canon' => $c, 'form_type' => $row['form_type'], 'views' => 0, 'starts' => 0, 'form_fills' => 0, 'calls' => 0, 'call_sessions' => 0 ];
+					}
+					foreach ( [ 'views', 'starts', 'form_fills', 'calls', 'call_sessions' ] as $k ) { $merged[ $mkey ][ $k ] += (int) $row[ $k ]; }
+				}
+				uasort( $merged, static function ( $a, $b ) { return $b['views'] <=> $a['views']; } );
+
+				$t = [ 'views' => 0, 'form_fills' => 0, 'calls' => 0, 'call_sessions' => 0, 'calls_only_taps' => 0, 'calls_only_sessions' => 0 ];
+				foreach ( $merged as $row ) {
 					$views  = (int) $row['views'];
 					$fills  = (int) $row['form_fills'];
 					$calls  = (int) $row['calls'];
 					$csess  = (int) $row['call_sessions'];
 					$conv   = $views > 0 ? round( ( $fills + $csess ) / $views * 100, 1 ) : null;
-					$src['pages'][] = array_merge( self::describe_page( (string) $row['page'] ), [
+					$c      = $row['canon'];
+					$label  = '' === $c['path'] ? self::describe_page( '' )
+						: ( $c['page_id'] ? self::describe_page( (string) $c['page_id'] ) : self::describe_page( home_url( $c['path'] ) ) );
+					$src['pages'][] = array_merge( $label, [
+						'path'           => $c['path'],
 						'form_type'      => $row['form_type'] ?: null,
 						'views'          => $views,
 						'starts'         => (int) $row['starts'],

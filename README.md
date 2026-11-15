@@ -15,6 +15,13 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.9.1
+- Analytics: a page tracked by URL in older events and by post ID in newer ones is now
+  shown once, not twice (e.g. "/" and "Home").
+- Analytics: sessions whose events carry no page — form views recorded before page
+  tracking existed — are counted under "(not attributed)" instead of being dropped, so
+  site totals no longer under-report.
+
 ### 1.9.0
 - New read-only `GET /analytics/funnel?days=30` for the conversion dashboard: per
   landing page views, form fills, call taps (with unique callers) and conversion,
