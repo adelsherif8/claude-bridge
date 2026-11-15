@@ -15,6 +15,18 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.9.0
+- New read-only `GET /analytics/funnel?days=30` for the conversion dashboard: per
+  landing page views, form fills, call taps (with unique callers) and conversion,
+  plus step drop-off and GoHighLevel delivery health.
+- Aggregated in SQL on the site and returned as counts only — no names, emails,
+  phone numbers, IP addresses or user agents leave the site.
+- Reads whichever form plugin is installed: Contact Form + GHL (`cfg_events`),
+  Autoshippers Forms (`as_events`) and CFT Group Forms (`cftg_funnel`), including
+  their schemas from before call tracking existed.
+- Taps on pages with no form views are reported separately so they never inflate
+  the conversion rate.
+
 ### 1.8.0
 - Updater: cache the release manifest for 12 hours instead of 30 minutes, cutting
   update-server requests per site by roughly 24x. Failed checks still retry after
