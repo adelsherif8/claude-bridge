@@ -19,6 +19,10 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 - Failed leads in `/entries` carry a short `reason`: the HTTP code and the message
   GoHighLevel sent back, in plain words for the common cases (invalid email or phone).
   Never the raw payload.
+- Reads the sites that use our own form code instead of a form plugin: CFT Storage
+  (`cft_lead` posts + `cft_form_events`) and PackOnce (`po_lead` posts + `po_form_events`).
+  Their views, starts, steps, sent leads, phone taps and leads show in `/analytics/funnel`
+  and `/entries` like any form plugin.
 
 ### 1.11.0
 - `GET /analytics/funnel` takes `offset` (days back), so the dashboard can compare a period

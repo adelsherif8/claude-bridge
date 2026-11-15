@@ -930,6 +930,132 @@ class Claude_Bridge {
 		];
 	}
 
+	/**
+	 * Sites with our own custom form code instead of a form plugin (CFT Storage, PackOnce).
+	 * Leads are private posts with prefixed meta; the funnel is a table of daily counters
+	 * (day, page, step, device, channel, n) — no sessions, so counts are visitor steps.
+	 *  steps    — funnel steps after the form is seen, in order; 'submit' is a sent lead
+	 *  page_map — how the counter's page key becomes a path ('path' = already a path)
+	 */
+	private static function custom_sources() {
+		return [
+			'cftstorage' => [ 'label' => 'CFT Storage quote form', 'post_type' => 'cft_lead', 'meta' => '_cft_', 'counters' => 'cft_form_events', 'page_map' => 'path',
+				'form_key' => 'type', 'form_default' => 'Quote', 'steps' => [ 'view' => 'Saw a form', 'start' => 'Started a form', 'submit' => 'Sent a request' ] ],
+			'packonce'   => [ 'label' => 'PackOnce estimator', 'post_type' => 'po_lead', 'meta' => '_po_', 'counters' => 'po_form_events', 'page_map' => 'key',
+				'form_key' => '', 'form_default' => 'Moving estimate', 'steps' => [ 'view' => 'Saw the form', 'start' => 'Started the form', 'route' => 'Entered a route', 'size' => 'Chose a home size', 'submit' => 'Sent details' ] ],
+		];
+	}
+
+	/** Counter page key → canonical path. CFT stores "/form-a/", PackOnce stores "home", "moving"… */
+	private static function custom_page_path( $key, array $cfg ) {
+		$key = (string) $key;
+		if ( 'path' === $cfg['page_map'] ) { return '' === $key ? '' : $key; }
+		if ( '' === $key ) { return ''; }
+		return 'home' === $key ? '/' : '/' . trim( $key, '/' ) . '/';
+	}
+
+	/** Leads of one custom source in [since, until): id, date, name, email, phone, form, ghl, page, utm. */
+	private static function custom_leads( array $cfg, $since, $until, $limit = 5000 ) {
+		if ( ! post_type_exists( $cfg['post_type'] ) && ! self::custom_has_posts( $cfg ) ) { return null; }
+		$ids = get_posts( [ 'post_type' => $cfg['post_type'], 'post_status' => [ 'private', 'publish' ], 'numberposts' => $limit, 'fields' => 'ids',
+			'orderby' => 'date', 'order' => 'DESC', 'suppress_filters' => true,
+			'date_query' => [ [ 'after' => $since, 'before' => $until, 'inclusive' => true, 'column' => 'post_date' ] ] ] );
+		if ( $ids ) { update_meta_cache( 'post', $ids ); }
+		$m   = $cfg['meta'];
+		$out = [];
+		foreach ( $ids as $id ) {
+			$g   = static function ( $k ) use ( $id, $m ) { return get_post_meta( $id, $m . $k, true ); };
+			$utm = $g( 'utm' );
+			$form = $cfg['form_key'] ? (string) $g( $cfg['form_key'] ) : '';
+			$out[] = [
+				'id' => (int) $id, 'date' => get_post_field( 'post_date', $id ), 'name' => (string) $g( 'name' ), 'email' => (string) $g( 'email' ),
+				'phone' => (string) $g( 'phone' ), 'form' => '' !== $form ? $form : $cfg['form_default'], 'ghl' => strtolower( (string) $g( 'ghl' ) ),
+				'page' => (string) $g( 'page' ), 'j' => is_array( $utm ) ? $utm : [],
+			];
+		}
+		return $out;
+	}
+	private static function custom_has_posts( array $cfg ) {
+		global $wpdb;
+		return (bool) $wpdb->get_var( $wpdb->prepare( "SELECT 1 FROM {$wpdb->posts} WHERE post_type = %s LIMIT 1", $cfg['post_type'] ) ); // phpcs:ignore WordPress.DB
+	}
+
+	/** One funnel "source" block for a custom setup, in the same shape as the plugin sources. */
+	private static function custom_funnel( array $cfg, $since, $until ) {
+		global $wpdb;
+		$table  = $wpdb->prefix . $cfg['counters'];
+		$has_ev = self::table_exists( $table );
+		$leads  = self::custom_leads( $cfg, $since, $until );
+		if ( ! $has_ev && null === $leads ) { return null; }
+		$src = [ 'label' => $cfg['label'], 'has_events' => $has_ev, 'tracks_calls' => false, 'pages' => [], 'steps' => [], 'totals' => [] ];
+
+		if ( $has_ev ) {
+			$d1   = substr( $since, 0, 10 );
+			$d2   = '9999' === substr( $until, 0, 4 ) ? '9999-12-31' : gmdate( 'Y-m-d', strtotime( $until ) - 1 );
+			$rows = $wpdb->get_results( $wpdb->prepare( "SELECT page, step, SUM(n) AS n FROM `{$table}` WHERE day >= %s AND day <= %s GROUP BY page, step", $d1, $d2 ), ARRAY_A ); // phpcs:ignore WordPress.DB
+			$pages = []; $stepTot = [];
+			foreach ( (array) $rows as $r ) {
+				$path = self::custom_page_path( $r['page'], $cfg );
+				$c    = '' === $path ? [ 'path' => '', 'page_id' => 0 ] : self::canonical_page( home_url( $path ) );
+				$k    = $c['path'];
+				if ( ! isset( $pages[ $k ] ) ) { $pages[ $k ] = [ 'canon' => $c, 'visit' => 0, 'view' => 0, 'start' => 0, 'submit' => 0, 'call' => 0 ]; }
+				if ( isset( $pages[ $k ][ $r['step'] ] ) ) { $pages[ $k ][ $r['step'] ] += (int) $r['n']; }
+				$stepTot[ $r['step'] ] = ( $stepTot[ $r['step'] ] ?? 0 ) + (int) $r['n'];
+			}
+			uasort( $pages, static function ( $a, $b ) { return $b['view'] <=> $a['view']; } );
+			$t = [ 'views' => 0, 'form_fills' => 0, 'calls' => 0, 'call_sessions' => 0, 'calls_only_taps' => 0, 'calls_only_sessions' => 0 ];
+			foreach ( $pages as $p ) {
+				// A form view is the denominator; pages with only visits/calls have no form on them.
+				$views = $p['view']; $fills = $p['submit']; $calls = $p['call'];
+				if ( ! $views && ! $fills && ! $calls ) { continue; }
+				$c     = $p['canon'];
+				$label = '' === $c['path'] ? self::describe_page( '' ) : ( $c['page_id'] ? self::describe_page( (string) $c['page_id'] ) : self::describe_page( home_url( $c['path'] ) ) );
+				$src['pages'][] = array_merge( $label, [
+					'path' => $c['path'], 'form_type' => null, 'views' => $views, 'starts' => $p['start'], 'form_fills' => $fills,
+					'calls' => $calls, 'call_sessions' => $calls,
+					'conv_total_pct' => $views > 0 ? round( ( $fills + $calls ) / $views * 100, 1 ) : null,
+					'conv_form_pct'  => $views > 0 ? round( $fills / $views * 100, 1 ) : null,
+					'conv_call_pct'  => $views > 0 ? round( $calls / $views * 100, 1 ) : null,
+				] );
+				$t['calls'] += $calls;
+				if ( $views > 0 ) { $t['views'] += $views; $t['form_fills'] += $fills; $t['call_sessions'] += $calls; }
+				else { $t['calls_only_taps'] += $calls; $t['calls_only_sessions'] += $calls; }
+				if ( $calls > 0 ) { $src['tracks_calls'] = true; }
+			}
+			$t['conv_total_pct'] = $t['views'] > 0 ? round( ( $t['form_fills'] + $t['call_sessions'] ) / $t['views'] * 100, 1 ) : null;
+			$t['conv_form_pct']  = $t['views'] > 0 ? round( $t['form_fills'] / $t['views'] * 100, 1 ) : null;
+			$t['conv_call_pct']  = $t['views'] > 0 ? round( $t['call_sessions'] / $t['views'] * 100, 1 ) : null;
+			$src['totals'] = $t;
+			// Where people stop: each step's count minus the next step's.
+			$keys = array_keys( $cfg['steps'] );
+			foreach ( $keys as $i => $k ) {
+				if ( 'submit' === $k ) { continue; }
+				$reached = (int) ( $stepTot[ $k ] ?? 0 );
+				$next    = isset( $keys[ $i + 1 ] ) ? (int) ( $stepTot[ $keys[ $i + 1 ] ] ?? 0 ) : 0;
+				if ( $reached ) { $src['steps'][] = [ 'form_type' => null, 'step' => $cfg['steps'][ $k ], 'reached' => $reached, 'drop_offs' => max( 0, $reached - $next ) ]; }
+			}
+		}
+
+		if ( null !== $leads ) {
+			$byday = []; $bad = 0; $status = [];
+			foreach ( $leads as $l ) {
+				$day = substr( $l['date'], 0, 10 );
+				$byday[ $day ] = ( $byday[ $day ] ?? 0 ) + 1;
+				if ( 'failed' === $l['ghl'] ) { $bad++; }
+				$st = $l['ghl'] ?: 'unknown'; $status[ $st ] = ( $status[ $st ] ?? 0 ) + 1;
+			}
+			ksort( $byday );
+			$total = count( $leads );
+			$src['leads']   = self::breakdown_rows( array_map( static function ( $l ) { return [ 'created_at' => $l['date'], 'form' => $l['form'], 'j' => $l['j'] ]; }, $leads ) );
+			$src['entries'] = [
+				'total' => $total, 'failed' => $bad, 'success_pct' => $total ? round( ( $total - $bad ) / $total * 100, 1 ) : null,
+				'by_status' => array_map( static function ( $k, $v ) { return [ 'status' => $k, 'cnt' => $v ]; }, array_keys( $status ), $status ),
+				'by_day' => array_map( static function ( $k, $v ) { return [ 'day' => $k, 'cnt' => $v ]; }, array_keys( $byday ), $byday ),
+			];
+		}
+		return $src;
+	}
+
 	private static function table_exists( $table ) {
 		global $wpdb;
 		return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table; // phpcs:ignore WordPress.DB
@@ -1166,6 +1292,10 @@ class Claude_Bridge {
 			$out['sources'][ $key ] = $src;
 		}
 
+		foreach ( self::custom_sources() as $key => $cfg ) {
+			$src = self::custom_funnel( $cfg, $since, $until );
+			if ( $src ) { $out['sources'][ $key ] = $src; }
+		}
 		if ( ! $out['sources'] ) { $out['note'] = 'No known form plugin tables found on this site.'; }
 		return $out;
 	}
@@ -1194,10 +1324,16 @@ class Claude_Bridge {
 		$fc   = self::column_exists( $table, $cfg['eform'] ) ? $cfg['eform'] : null;
 		$cols = 'created_at' . ( $fc ? ", `{$fc}` AS form" : '' ) . ( $jc ? ", `{$jc}` AS j" : '' );
 		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT {$cols} FROM `{$table}` WHERE created_at >= %s AND created_at < %s ORDER BY id DESC LIMIT 5000", $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
+		$rows = (array) $rows;
+		foreach ( $rows as $i => $row ) { $rows[ $i ]['j'] = $jc ? self::entry_json( $row['j'] ?? '' ) : []; }
+		return self::breakdown_rows( $rows );
+	}
 
+	/** Rows of { created_at, form, j (tracking array) } → counts. */
+	private static function breakdown_rows( array $rows ) {
 		$out = [ 'by_source' => [], 'by_campaign' => [], 'by_form' => [], 'by_weekday' => array_fill( 0, 7, 0 ), 'by_hour' => array_fill( 0, 24, 0 ) ];
 		foreach ( (array) $rows as $row ) {
-			$j   = $jc ? self::entry_json( $row['j'] ) : [];
+			$j   = is_array( $row['j'] ?? null ) ? $row['j'] : [];
 			$src = self::lead_source( $j );
 			$out['by_source'][ $src ] = ( $out['by_source'][ $src ] ?? 0 ) + 1;
 			$camp = trim( (string) ( $j['utm_campaign'] ?? '' ) );
@@ -1274,6 +1410,26 @@ class Claude_Bridge {
 					'campaign' => mb_substr( (string) ( $j['utm_campaign'] ?? '' ), 0, 80 ),
 					'page'     => esc_url_raw( (string) ( $j['page_url'] ?? $j['landing'] ?? '' ) ),
 					'reason'   => $isf ? self::fail_reason( $j, (string) ( $row['ghl_message'] ?? '' ) ) : '',
+				];
+			}
+		}
+		$until_all = '9999-12-31 00:00:00';
+		foreach ( self::custom_sources() as $key => $cfg ) {
+			$leads = self::custom_leads( $cfg, $since, $until_all );
+			if ( null === $leads ) { continue; }
+			foreach ( $leads as $l ) { $forms[] = $l['form']; }
+			foreach ( $leads as $l ) {
+				$isf = 'failed' === $l['ghl'];
+				if ( 'failed' === $status && ! $isf ) { continue; }
+				if ( 'sent' === $status && $isf ) { continue; }
+				if ( '' !== $formf && $l['form'] !== $formf ) { continue; }
+				if ( '' !== $q && false === stripos( $l['name'] . ' ' . $l['email'] . ' ' . $l['phone'], $q ) ) { continue; }
+				$total++;
+				$rows[] = [
+					'id' => $key . '-' . $l['id'], 'date' => $l['date'], 'form' => $l['form'], 'name' => $l['name'], 'email' => $l['email'], 'phone' => $l['phone'],
+					'status' => $isf ? 'failed' : ( $l['ghl'] ? 'sent' : 'unknown' ), 'source' => self::lead_source( $l['j'] ),
+					'campaign' => mb_substr( (string) ( $l['j']['utm_campaign'] ?? '' ), 0, 80 ), 'page' => esc_url_raw( $l['page'] ),
+					'reason' => $isf ? 'Not accepted by GoHighLevel — this site doesn\'t save the reason; add the lead by hand' : '',
 				];
 			}
 		}
