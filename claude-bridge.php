@@ -398,6 +398,7 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/plugin-settings/restore', [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'restore_plugin_settings' ] ] );
 		register_rest_route( CB_NS, '/option',            [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'site_option' ] ] );
 		register_rest_route( CB_NS, '/wc/products',       [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_products' ] ] );
+		register_rest_route( CB_NS, '/entries',          [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'list_entries' ] ] );
 		register_rest_route( CB_NS, '/analytics/funnel',  [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'analytics_funnel' ] ] );
 		register_rest_route( CB_NS, '/cftg/entries',      [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'cftg_entries' ] ] );
 		register_rest_route( CB_NS, '/purge',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'purge_endpoint' ] ] );
@@ -923,9 +924,9 @@ class Claude_Bridge {
 	 */
 	private static function analytics_sources() {
 		return [
-			'dental'       => [ 'label' => 'Contact Form + GHL', 'events' => 'cfg_events',  'entries' => 'cfg_entries',  'event' => 'event_type', 'done' => [ 'complete' ], 'step' => 'step_key', 'form_col' => true,  'landing' => true  ],
-			'autoshippers' => [ 'label' => 'Autoshippers Forms', 'events' => 'as_events',   'entries' => 'as_entries',   'event' => 'event_type', 'done' => [ 'complete' ], 'step' => 'step_key', 'form_col' => false, 'landing' => false ],
-			'cftgroup'     => [ 'label' => 'CFT Group Forms',    'events' => 'cftg_funnel', 'entries' => 'cftg_entries', 'event' => 'event',      'done' => [ 'submit' ],   'step' => 'step_num', 'form_col' => true,  'landing' => false ],
+			'dental'       => [ 'label' => 'Contact Form + GHL', 'events' => 'cfg_events',  'entries' => 'cfg_entries',  'event' => 'event_type', 'done' => [ 'complete' ], 'step' => 'step_key', 'form_col' => true,  'landing' => true,  'json' => 'meta', 'eform' => 'form_type' ],
+			'autoshippers' => [ 'label' => 'Autoshippers Forms', 'events' => 'as_events',   'entries' => 'as_entries',   'event' => 'event_type', 'done' => [ 'complete' ], 'step' => 'step_key', 'form_col' => false, 'landing' => false, 'json' => 'data', 'eform' => 'tag' ],
+			'cftgroup'     => [ 'label' => 'CFT Group Forms',    'events' => 'cftg_funnel', 'entries' => 'cftg_entries', 'event' => 'event',      'done' => [ 'submit' ],   'step' => 'step_num', 'form_col' => true,  'landing' => false, 'json' => 'data', 'eform' => 'form_type' ],
 		];
 	}
 
@@ -994,8 +995,12 @@ class Claude_Bridge {
 		global $wpdb;
 
 		$days  = min( 365, max( 1, (int) ( $r->get_param( 'days' ) ?: 30 ) ) );
-		$since = gmdate( 'Y-m-d H:i:s', strtotime( "-{$days} days", current_time( 'timestamp' ) ) );
-		$out   = [ 'ok' => true, 'site' => home_url(), 'days' => $days, 'since' => $since, 'sources' => [] ];
+		// offset shifts the window back, so the dashboard can ask for the previous period.
+		$offset = min( 730, max( 0, (int) $r->get_param( 'offset' ) ) );
+		$now    = current_time( 'timestamp' );
+		$since  = gmdate( 'Y-m-d H:i:s', strtotime( '-' . ( $days + $offset ) . ' days', $now ) );
+		$until  = $offset ? gmdate( 'Y-m-d H:i:s', strtotime( "-{$offset} days", $now ) ) : '9999-12-31 00:00:00';
+		$out    = [ 'ok' => true, 'site' => home_url(), 'days' => $days, 'offset' => $offset, 'since' => $since, 'until' => $offset ? $until : null, 'sources' => [] ];
 
 		foreach ( self::analytics_sources() as $key => $cfg ) {
 			$events  = $wpdb->prefix . $cfg['events'];
@@ -1043,16 +1048,16 @@ class Claude_Bridge {
 								MIN(CASE WHEN {$page} <> '' THEN id END) AS first_page_id,
 								MIN(id) AS first_id
 							FROM `{$events}`
-							WHERE created_at >= %s AND session_id <> ''
+							WHERE created_at >= %s AND created_at < %s AND session_id <> ''
 							GROUP BY session_id
 						) f
 						LEFT JOIN `{$events}` pe ON pe.id = f.first_page_id
 						LEFT JOIN `{$events}` fe ON fe.id = f.first_id
 					) s
-					JOIN `{$events}` ev ON ev.session_id = s.session_id AND ev.created_at >= %s
+					JOIN `{$events}` ev ON ev.session_id = s.session_id AND ev.created_at >= %s AND ev.created_at < %s
 					GROUP BY s.page, s.form_type
 					ORDER BY views DESC";
-				$rows = $wpdb->get_results( $wpdb->prepare( $sql, $since, $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+				$rows = $wpdb->get_results( $wpdb->prepare( $sql, $since, $until, $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
 
 				// Taps on pages with no form views (contact page, header phone number) are real
 				// calls but have no denominator, so they're counted apart from the rate.
@@ -1110,20 +1115,20 @@ class Claude_Bridge {
 						SELECT {$formsel} AS form_type, {$stc} AS step,
 							COUNT(DISTINCT session_id) AS reached
 						FROM `{$events}`
-						WHERE {$evc} = 'step' AND created_at >= %s AND {$step_set}
-						GROUP BY form_type, step ORDER BY reached DESC LIMIT 60", $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+						WHERE {$evc} = 'step' AND created_at >= %s AND created_at < %s AND {$step_set}
+						GROUP BY form_type, step ORDER BY reached DESC LIMIT 60", $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
 					$last_form = $has_form ? 'le.form_type' : "''";
 					$drops = $wpdb->get_results( $wpdb->prepare( "
 						SELECT {$last_form} AS form_type, le.{$stc} AS step, COUNT(*) AS drop_offs
 						FROM (
 							SELECT session_id, MAX(id) AS last_id
 							FROM `{$events}`
-							WHERE {$evc} = 'step' AND created_at >= %s
-								AND session_id NOT IN (SELECT session_id FROM `{$events}` WHERE {$evc} IN ({$done}) AND created_at >= %s)
+							WHERE {$evc} = 'step' AND created_at >= %s AND created_at < %s
+								AND session_id NOT IN (SELECT session_id FROM `{$events}` WHERE {$evc} IN ({$done}) AND created_at >= %s AND created_at < %s)
 							GROUP BY session_id
 						) ls
 						JOIN `{$events}` le ON le.id = ls.last_id
-						GROUP BY form_type, step ORDER BY drop_offs DESC LIMIT 60", $since, $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+						GROUP BY form_type, step ORDER BY drop_offs DESC LIMIT 60", $since, $until, $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
 				}
 				$dropmap = [];
 				foreach ( (array) $drops as $d ) { $dropmap[ $d['form_type'] . '|' . $d['step'] ] = (int) $d['drop_offs']; }
@@ -1140,14 +1145,15 @@ class Claude_Bridge {
 
 			if ( $has_en ) {
 				$statuses = $wpdb->get_results( $wpdb->prepare(
-					"SELECT ghl_status AS status, COUNT(*) AS cnt FROM `{$entries}` WHERE created_at >= %s GROUP BY ghl_status", $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+					"SELECT ghl_status AS status, COUNT(*) AS cnt FROM `{$entries}` WHERE created_at >= %s AND created_at < %s GROUP BY ghl_status", $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
 				$byday = $wpdb->get_results( $wpdb->prepare(
-					"SELECT DATE(created_at) AS day, COUNT(*) AS cnt FROM `{$entries}` WHERE created_at >= %s GROUP BY DATE(created_at) ORDER BY day ASC", $since ), ARRAY_A ); // phpcs:ignore WordPress.DB
+					"SELECT DATE(created_at) AS day, COUNT(*) AS cnt FROM `{$entries}` WHERE created_at >= %s AND created_at < %s GROUP BY DATE(created_at) ORDER BY day ASC", $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
 				$total = 0; $bad = 0;
 				foreach ( (array) $statuses as $st ) {
 					$total += (int) $st['cnt'];
 					if ( in_array( strtolower( (string) $st['status'] ), [ 'error', 'failed' ], true ) ) { $bad += (int) $st['cnt']; }
 				}
+				$src['leads'] = self::lead_breakdown( $entries, $cfg, $since, $until );
 				$src['entries'] = [
 					'total'       => $total,
 					'failed'      => $bad,
@@ -1162,6 +1168,115 @@ class Claude_Bridge {
 
 		if ( ! $out['sources'] ) { $out['note'] = 'No known form plugin tables found on this site.'; }
 		return $out;
+	}
+
+
+	/** Where a lead came from, from the tracking data the form saved with it. */
+	private static function lead_source( array $j ) {
+		$src = strtolower( trim( (string) ( $j['utm_source'] ?? '' ) ) );
+		$med = strtolower( trim( (string) ( $j['utm_medium'] ?? '' ) ) );
+		if ( ! empty( $j['gclid'] ) || ( in_array( $src, [ 'google', 'adwords', 'googleads' ], true ) && in_array( $med, [ 'cpc', 'ppc', 'paid', 'paidsearch', 'paid_search' ], true ) ) ) { return 'Google Ads'; }
+		if ( ! empty( $j['fbclid'] ) || in_array( $src, [ 'facebook', 'fb', 'instagram', 'ig', 'meta' ], true ) ) { return 'Facebook / Instagram'; }
+		if ( ! empty( $j['msclkid'] ) || in_array( $src, [ 'bing', 'microsoft' ], true ) ) { return 'Microsoft Ads'; }
+		if ( '' !== $src || ! empty( $j['utm_campaign'] ) ) { return 'Other campaigns'; }
+		return 'Direct / organic';
+	}
+
+	private static function entry_json( $raw ) {
+		$j = json_decode( (string) $raw, true );
+		return is_array( $j ) ? $j : [];
+	}
+
+	/** Counts by source, campaign, form, weekday and hour — never names, emails or phones. */
+	private static function lead_breakdown( $table, array $cfg, $since, $until ) {
+		global $wpdb;
+		$jc   = self::column_exists( $table, $cfg['json'] ) ? $cfg['json'] : null;
+		$fc   = self::column_exists( $table, $cfg['eform'] ) ? $cfg['eform'] : null;
+		$cols = 'created_at' . ( $fc ? ", `{$fc}` AS form" : '' ) . ( $jc ? ", `{$jc}` AS j" : '' );
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT {$cols} FROM `{$table}` WHERE created_at >= %s AND created_at < %s ORDER BY id DESC LIMIT 5000", $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
+
+		$out = [ 'by_source' => [], 'by_campaign' => [], 'by_form' => [], 'by_weekday' => array_fill( 0, 7, 0 ), 'by_hour' => array_fill( 0, 24, 0 ) ];
+		foreach ( (array) $rows as $row ) {
+			$j   = $jc ? self::entry_json( $row['j'] ) : [];
+			$src = self::lead_source( $j );
+			$out['by_source'][ $src ] = ( $out['by_source'][ $src ] ?? 0 ) + 1;
+			$camp = trim( (string) ( $j['utm_campaign'] ?? '' ) );
+			if ( '' !== $camp ) { $camp = mb_substr( $camp, 0, 80 ); $out['by_campaign'][ $camp ] = ( $out['by_campaign'][ $camp ] ?? 0 ) + 1; }
+			$form = trim( (string) ( $row['form'] ?? '' ) );
+			if ( '' !== $form ) { $out['by_form'][ $form ] = ( $out['by_form'][ $form ] ?? 0 ) + 1; }
+			$ts = strtotime( $row['created_at'] );
+			if ( $ts ) { $out['by_weekday'][ (int) gmdate( 'w', $ts ) ]++; $out['by_hour'][ (int) gmdate( 'G', $ts ) ]++; }
+		}
+		arsort( $out['by_source'] ); arsort( $out['by_form'] ); arsort( $out['by_campaign'] );
+		$out['by_campaign'] = array_slice( $out['by_campaign'], 0, 10, true );
+		$out['sampled']     = count( (array) $rows ) >= 5000;
+		return $out;
+	}
+
+	/**
+	 * GET /entries?days=&page=&per_page=&q=&status=&form=
+	 * The actual leads, newest first, from whichever form plugin the site runs. Contact
+	 * details are included (that's the point), but never IP addresses or raw GHL payloads.
+	 */
+	public static function list_entries( WP_REST_Request $r ) {
+		global $wpdb;
+		$days     = min( 730, max( 1, (int) ( $r->get_param( 'days' ) ?: 30 ) ) );
+		$per      = min( 200, max( 1, (int) ( $r->get_param( 'per_page' ) ?: 50 ) ) );
+		$page     = max( 1, (int) $r->get_param( 'page' ) );
+		$since    = gmdate( 'Y-m-d H:i:s', strtotime( "-{$days} days", current_time( 'timestamp' ) ) );
+		$q        = trim( (string) $r->get_param( 'q' ) );
+		$status   = sanitize_key( (string) $r->get_param( 'status' ) );
+		$formf    = sanitize_text_field( (string) $r->get_param( 'form' ) );
+		$sent     = [ 'ok', 'sent', 'success' ];
+		$failed   = [ 'error', 'failed' ];
+		$rows     = [];
+		$total    = 0;
+		$forms    = [];
+
+		foreach ( self::analytics_sources() as $key => $cfg ) {
+			$t = $wpdb->prefix . $cfg['entries'];
+			if ( ! self::table_exists( $t ) ) { continue; }
+			$jc = self::column_exists( $t, $cfg['json'] ) ? $cfg['json'] : null;
+			$fc = self::column_exists( $t, $cfg['eform'] ) ? $cfg['eform'] : null;
+
+			$where = [ 'created_at >= %s' ]; $args = [ $since ];
+			if ( '' !== $q ) {
+				$like    = '%' . $wpdb->esc_like( $q ) . '%';
+				$where[] = '(first_name LIKE %s OR last_name LIKE %s OR email LIKE %s OR phone LIKE %s)';
+				array_push( $args, $like, $like, $like, $like );
+			}
+			if ( 'sent' === $status )   { $where[] = "ghl_status IN ('" . implode( "','", $sent ) . "')"; }
+			if ( 'failed' === $status ) { $where[] = "ghl_status IN ('" . implode( "','", $failed ) . "')"; }
+			if ( '' !== $formf && $fc ) { $where[] = "`{$fc}` = %s"; $args[] = $formf; }
+			$clause = implode( ' AND ', $where );
+
+			$total += (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$t}` WHERE {$clause}", $args ) ); // phpcs:ignore WordPress.DB
+			if ( $fc ) {
+				foreach ( (array) $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT `{$fc}` FROM `{$t}` WHERE created_at >= %s", $since ) ) as $f ) { if ( '' !== $f ) { $forms[] = $f; } } // phpcs:ignore WordPress.DB
+			}
+
+			$cols = 'id, created_at, first_name, last_name, email, phone, ghl_status' . ( $fc ? ", `{$fc}` AS form" : '' ) . ( $jc ? ", `{$jc}` AS j" : '' );
+			$res  = $wpdb->get_results( $wpdb->prepare( "SELECT {$cols} FROM `{$t}` WHERE {$clause} ORDER BY created_at DESC, id DESC LIMIT %d", array_merge( $args, [ $per * $page ] ) ), ARRAY_A ); // phpcs:ignore WordPress.DB
+			foreach ( (array) $res as $row ) {
+				$j  = $jc ? self::entry_json( $row['j'] ) : [];
+				$st = strtolower( (string) $row['ghl_status'] );
+				$rows[] = [
+					'id'       => $key . '-' . $row['id'],
+					'date'     => $row['created_at'],
+					'form'     => $row['form'] ?? '',
+					'name'     => trim( $row['first_name'] . ' ' . $row['last_name'] ),
+					'email'    => $row['email'],
+					'phone'    => $row['phone'],
+					'status'   => in_array( $st, $sent, true ) ? 'sent' : ( in_array( $st, $failed, true ) ? 'failed' : ( $st ?: 'unknown' ) ),
+					'source'   => self::lead_source( $j ),
+					'campaign' => mb_substr( (string) ( $j['utm_campaign'] ?? '' ), 0, 80 ),
+					'page'     => esc_url_raw( (string) ( $j['page_url'] ?? $j['landing'] ?? '' ) ),
+				];
+			}
+		}
+		usort( $rows, static function ( $a, $b ) { return strcmp( $b['date'], $a['date'] ) ?: strcmp( $b['id'], $a['id'] ); } );
+		return [ 'ok' => true, 'total' => $total, 'page' => $page, 'per_page' => $per, 'forms' => array_values( array_unique( $forms ) ),
+			'rows' => array_slice( $rows, ( $page - 1 ) * $per, $per ) ];
 	}
 
 	/* ─── CFT Group Forms (read-only) ─── */

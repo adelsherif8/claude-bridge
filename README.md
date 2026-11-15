@@ -15,6 +15,17 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.11.0
+- `GET /analytics/funnel` takes `offset` (days back), so the dashboard can compare a period
+  with the one before it.
+- It also returns lead breakdowns, counted on the site: by source (Google Ads, Facebook /
+  Instagram, Microsoft Ads, other campaigns, direct / organic, worked out from `gclid`,
+  `fbclid`, `msclkid` and UTM tags), top UTM campaigns, form, weekday and hour. Counts only.
+- New `GET /entries?days=&page=&per_page=&q=&status=&form=`: the actual leads from whichever
+  form plugin the site runs, newest first, searchable by name/email/phone and filterable by
+  delivery status and form. Includes source and campaign; never IP addresses or raw GHL
+  payloads.
+
 ### 1.10.0
 - New `GET /plugins` and `POST /plugins/update`: update Adel's own plugins (Contact Form +
   GoHighLevel, CFT Group Forms, AutoShippers Forms) to the version their own updater offers.
