@@ -1330,10 +1330,97 @@ class Claude_Bridge {
 			$src = self::custom_funnel( $cfg, $since, $until );
 			if ( $src ) { $out['sources'][ $key ] = $src; }
 		}
+		$qi = self::quality_index( $since, $until );
+		foreach ( $out['sources'] as $key => &$src ) {
+			if ( isset( $src['entries'] ) ) {
+				$src['entries']['repeats'] = $qi['counts'][ $key ]['repeats'] ?? 0;
+				$src['entries']['spam']    = $qi['counts'][ $key ]['spam'] ?? 0;
+			}
+		}
+		unset( $src );
 		if ( ! $out['sources'] ) { $out['note'] = 'No known form plugin tables found on this site.'; }
 		return $out;
 	}
 
+
+
+	/* ─── lead quality: repeats and likely spam ─── */
+
+	/** A short reason when a lead looks like junk, else ''. Deliberately conservative. */
+	private static function spam_reason( $name, $email, $phone ) {
+		$name  = trim( (string) $name ); $email = strtolower( trim( (string) $email ) ); $phone = (string) $phone;
+		$n     = strtolower( $name );
+		$dig   = preg_replace( '/\D/', '', $phone );
+		$local = strstr( $email, '@', true ) ?: '';
+		$dom   = substr( strrchr( $email, '@' ) ?: '', 1 );
+		if ( preg_match( '~https?://|www\.|\.(ru|cn|xyz|top)\b|<a\s~i', $name ) ) { return 'Link in the name'; }
+		if ( preg_match( '/^(test|testing|asdf|qwerty|aaa+|xxx+|abc|fake|none|na|n\/a|demo|sample)(\s|$)/i', $n ) || in_array( $local, [ 'test', 'testing', 'asdf', 'qwerty', 'fake', 'abc' ], true ) ) { return 'Test or placeholder entry'; }
+		if ( '' !== $name && ! preg_match( '/\p{L}/u', $name ) ) { return 'Name has no letters'; }
+		if ( preg_match( '/(.)\1{4,}/u', $n ) ) { return 'Repeated characters in the name'; }
+		foreach ( preg_split( '/\s+/', $n ) as $w ) { if ( preg_match( '/[bcdfghjklmnpqrstvwxz]{6,}/i', $w ) ) { return 'Gibberish name'; } }
+		$disposable = [ 'mailinator.com', 'guerrillamail.com', 'yopmail.com', '10minutemail.com', 'tempmail.com', 'temp-mail.org', 'sharklasers.com', 'trashmail.com', 'getnada.com', 'dispostable.com', 'maildrop.cc', 'throwawaymail.com' ];
+		if ( in_array( $dom, $disposable, true ) ) { return 'Throwaway email address'; }
+		if ( '' !== $dig ) {
+			if ( strlen( $dig ) < 7 ) { return 'Phone number too short'; }
+			if ( preg_match( '/^(\d)\1+$/', $dig ) ) { return 'Fake phone number'; }
+			if ( false !== strpos( '0123456789012345678901', $dig ) || false !== strpos( '9876543210987654321098', $dig ) ) { return 'Fake phone number'; }
+		}
+		if ( '' === $email && '' === $dig ) { return 'No email or phone'; }
+		return '';
+	}
+
+	/**
+	 * Every lead on the site in [since, until), across all forms: how many times the same
+	 * person (same email or phone) sent something, whether this row is a repeat of an earlier
+	 * one, and a spam reason. Keyed "source-id" like /entries rows. Cached per request.
+	 */
+	private static function quality_index( $since, $until ) {
+		static $cache = [];
+		$ck = $since . '|' . $until;
+		if ( isset( $cache[ $ck ] ) ) { return $cache[ $ck ]; }
+		global $wpdb;
+		$all = [];
+		foreach ( self::analytics_sources() as $key => $cfg ) {
+			$t = $wpdb->prefix . $cfg['entries'];
+			if ( ! self::table_exists( $t ) ) { continue; }
+			$res = $wpdb->get_results( $wpdb->prepare( "SELECT id, created_at, first_name, last_name, email, phone FROM `{$t}` WHERE created_at >= %s AND created_at < %s LIMIT 20000", $since, $until ), ARRAY_A ); // phpcs:ignore WordPress.DB
+			foreach ( (array) $res as $r ) { $all[] = [ 'k' => $key . '-' . $r['id'], 'src' => $key, 'date' => $r['created_at'], 'name' => trim( $r['first_name'] . ' ' . $r['last_name'] ), 'email' => $r['email'], 'phone' => $r['phone'] ]; }
+		}
+		foreach ( self::custom_sources() as $key => $cfg ) {
+			foreach ( (array) self::custom_leads( $cfg, $since, $until, 20000 ) as $l ) { $all[] = [ 'k' => $key . '-' . $l['id'], 'src' => $key, 'date' => $l['date'], 'name' => $l['name'], 'email' => $l['email'], 'phone' => $l['phone'] ]; }
+		}
+		usort( $all, static function ( $a, $b ) { return strcmp( $a['date'], $b['date'] ) ?: strcmp( $a['k'], $b['k'] ); } );
+		$keys = static function ( $r ) {
+			$out = [];
+			$e   = strtolower( trim( (string) $r['email'] ) );
+			if ( false !== strpos( $e, '@' ) && strlen( $e ) > 5 ) { $out[] = 'e:' . $e; }
+			$d = preg_replace( '/\D/', '', (string) $r['phone'] );
+			if ( strlen( $d ) >= 7 ) { $out[] = 'p:' . substr( $d, -10 ); }
+			return $out;
+		};
+		$size = [];
+		foreach ( $all as $r ) { foreach ( $keys( $r ) as $k ) { $size[ $k ] = ( $size[ $k ] ?? 0 ) + 1; } }
+		$seen = []; $map = []; $counts = [];
+		foreach ( $all as $r ) {
+			$ks     = $keys( $r );
+			$dupes  = 1; $repeat = false;
+			foreach ( $ks as $k ) { $dupes = max( $dupes, $size[ $k ] ); if ( isset( $seen[ $k ] ) ) { $repeat = true; } }
+			foreach ( $ks as $k ) { $seen[ $k ] = true; }
+			$spam = self::spam_reason( $r['name'], $r['email'], $r['phone'] );
+			$map[ $r['k'] ] = [ 'dupes' => $dupes, 'repeat' => $repeat, 'spam' => $spam ];
+			$c = &$counts[ $r['src'] ];
+			$c = ( $c ?? [ 'repeats' => 0, 'spam' => 0 ] );
+			if ( $repeat ) { $c['repeats']++; }
+			if ( '' !== $spam ) { $c['spam']++; }
+			unset( $c );
+		}
+		return $cache[ $ck ] = [ 'map' => $map, 'counts' => $counts ];
+	}
+
+	private static function quality_fields( array $qmap, $k ) {
+		$x = $qmap[ $k ] ?? [ 'dupes' => 1, 'repeat' => false, 'spam' => '' ];
+		return [ 'dupes' => (int) $x['dupes'], 'repeat' => (bool) $x['repeat'], 'spam' => (string) $x['spam'] ];
+	}
 
 	/** Where a lead came from, from the tracking data the form saved with it. */
 	private static function lead_source( array $j ) {
@@ -1402,10 +1489,23 @@ class Claude_Bridge {
 		$rows     = [];
 		$total    = 0;
 		$forms    = [];
+		$qi       = self::quality_index( $since, '9999-12-31 00:00:00' );
+		$qmap     = $qi['map'];
+		$qwant    = in_array( $status, [ 'dup', 'spam' ], true ) ? $status : '';
+		$qmatch   = static function ( $k ) use ( $qmap, $qwant ) {
+			$x = $qmap[ $k ] ?? null;
+			return 'dup' === $qwant ? ( $x && $x['dupes'] > 1 ) : ( $x && '' !== $x['spam'] );
+		};
 
 		foreach ( self::analytics_sources() as $key => $cfg ) {
 			$t = $wpdb->prefix . $cfg['entries'];
 			if ( ! self::table_exists( $t ) ) { continue; }
+			$qids = null;
+			if ( $qwant ) {
+				$qids = [];
+				foreach ( $qmap as $k => $x ) { if ( 0 === strpos( $k, $key . '-' ) && $qmatch( $k ) ) { $qids[] = (int) substr( $k, strlen( $key ) + 1 ); } }
+				if ( ! $qids ) { continue; }
+			}
 			$jc = self::column_exists( $t, $cfg['json'] ) ? $cfg['json'] : null;
 			$fc = self::column_exists( $t, $cfg['eform'] ) ? $cfg['eform'] : null;
 			$mc = self::column_exists( $t, 'ghl_message' );
@@ -1419,6 +1519,7 @@ class Claude_Bridge {
 			if ( 'sent' === $status )   { $where[] = "ghl_status IN ('" . implode( "','", $sent ) . "')"; }
 			if ( 'failed' === $status ) { $where[] = "ghl_status IN ('" . implode( "','", $failed ) . "')"; }
 			if ( '' !== $formf && $fc ) { $where[] = "`{$fc}` = %s"; $args[] = $formf; }
+			if ( $qids ) { $where[] = 'id IN (' . implode( ',', array_map( 'intval', $qids ) ) . ')'; }
 			$clause = implode( ' AND ', $where );
 
 			$total += (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$t}` WHERE {$clause}", $args ) ); // phpcs:ignore WordPress.DB
@@ -1444,7 +1545,7 @@ class Claude_Bridge {
 					'campaign' => mb_substr( (string) ( $j['utm_campaign'] ?? '' ), 0, 80 ),
 					'page'     => esc_url_raw( (string) ( $j['page_url'] ?? $j['landing'] ?? '' ) ),
 					'reason'   => $isf ? self::fail_reason( $j, (string) ( $row['ghl_message'] ?? '' ) ) : '',
-				];
+				] + self::quality_fields( $qmap, $key . '-' . $row['id'] );
 			}
 		}
 		$until_all = '9999-12-31 00:00:00';
@@ -1458,13 +1559,14 @@ class Claude_Bridge {
 				if ( 'sent' === $status && $isf ) { continue; }
 				if ( '' !== $formf && $l['form'] !== $formf ) { continue; }
 				if ( '' !== $q && false === stripos( $l['name'] . ' ' . $l['email'] . ' ' . $l['phone'], $q ) ) { continue; }
+				if ( $qwant && ! $qmatch( $key . '-' . $l['id'] ) ) { continue; }
 				$total++;
 				$rows[] = [
 					'id' => $key . '-' . $l['id'], 'date' => $l['date'], 'form' => $l['form'], 'name' => $l['name'], 'email' => $l['email'], 'phone' => $l['phone'],
 					'status' => $isf ? 'failed' : ( $l['ghl'] ? 'sent' : 'unknown' ), 'source' => self::lead_source( $l['j'] ),
 					'campaign' => mb_substr( (string) ( $l['j']['utm_campaign'] ?? '' ), 0, 80 ), 'page' => esc_url_raw( $l['page'] ),
 					'reason' => $isf ? 'Not accepted by GoHighLevel — this site doesn\'t save the reason; add the lead by hand' : '',
-				];
+				] + self::quality_fields( $qmap, $key . '-' . $l['id'] );
 			}
 		}
 		usort( $rows, static function ( $a, $b ) { return strcmp( $b['date'], $a['date'] ) ?: strcmp( $b['id'], $a['id'] ); } );

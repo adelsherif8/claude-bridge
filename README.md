@@ -15,6 +15,13 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.12.0
+- Lead quality, worked out on the site across every form: each `/entries` row has `dupes`
+  (how many times the same email or phone sent something in the period), `repeat` (an earlier
+  lead from the same person exists) and `spam` (a short reason: link or test name, gibberish,
+  throwaway email, fake or too-short phone, no contact details). `status=dup` / `status=spam`
+  filter to them, and `/analytics/funnel` entries report `repeats` and `spam` counts.
+
 ### 1.11.3
 - When the normal update reports "latest" because something on the site keeps Claude Bridge
   out of WordPress's update list, it installs the new version directly from the update server.
