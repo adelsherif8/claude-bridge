@@ -15,6 +15,11 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.11.1
+- Failed leads in `/entries` carry a short `reason`: the HTTP code and the message
+  GoHighLevel sent back, in plain words for the common cases (invalid email or phone).
+  Never the raw payload.
+
 ### 1.11.0
 - `GET /analytics/funnel` takes `offset` (days back), so the dashboard can compare a period
   with the one before it.
@@ -25,8 +30,6 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
   form plugin the site runs, newest first, searchable by name/email/phone and filterable by
   delivery status and form. Includes source and campaign; never IP addresses or raw GHL
   payloads.
-- Failed leads in `/entries` carry a short `reason`: the HTTP code and the message
-  GoHighLevel sent back (e.g. "HTTP 401 — Invalid JWT"). Never the raw payload.
 
 ### 1.10.0
 - New `GET /plugins` and `POST /plugins/update`: update Adel's own plugins (Contact Form +

@@ -1291,10 +1291,14 @@ class Claude_Bridge {
 		$code = (int) ( $j['_ghl_http_code'] ?? $j['_ghl_http'] ?? 0 );
 		$resp = $j['_ghl_response'] ?? '';
 		$r    = is_array( $resp ) ? $resp : json_decode( (string) $resp, true );
-		$text = trim( $msg );
-		if ( '' === $text && is_array( $r ) ) {
+		$text = '';
+		if ( is_array( $r ) ) {
 			$m    = $r['message'] ?? $r['msg'] ?? $r['error'] ?? '';
-			$text = is_array( $m ) ? implode( '; ', array_map( 'strval', array_filter( $m, 'is_scalar' ) ) ) : (string) $m;
+			$text = trim( is_array( $m ) ? implode( '; ', array_map( 'strval', array_filter( $m, 'is_scalar' ) ) ) : (string) $m );
+		}
+		// The plugin's own note, unless it's just "…: Array" from a stringified response.
+		if ( '' === $text && '' !== trim( $msg ) && ! preg_match( '/\bArray\s*$/', $msg ) ) {
+			$text = trim( $msg );
 		}
 		if ( '' === $text && ! is_array( $r ) && is_string( $resp ) && '' !== trim( $resp ) && strlen( $resp ) < 200 && false === strpos( $resp, '<' ) ) {
 			$text = trim( $resp );
@@ -1302,6 +1306,11 @@ class Claude_Bridge {
 		$hint = [ 0 => 'No response from GoHighLevel (timeout or connection error)', 400 => 'GoHighLevel rejected the data', 401 => 'GoHighLevel key is invalid or expired',
 			403 => 'GoHighLevel key lacks permission', 404 => 'GoHighLevel location or field not found', 422 => 'GoHighLevel rejected a field value', 429 => 'GoHighLevel rate limit hit' ];
 		$base = ! $has ? 'Not accepted by GoHighLevel (no details were saved for this lead)' : $hint[ $code ] ?? ( $code >= 500 ? 'GoHighLevel server error' : 'Not accepted by GoHighLevel' );
+		if ( preg_match( '/email must be an email/i', $text ) ) {
+			$text = "The email they typed isn't valid, so GoHighLevel refused the lead";
+		} elseif ( preg_match( '/phone number/i', $text ) ) {
+			$text = "The phone number they typed isn't valid, so GoHighLevel refused the lead";
+		}
 		$out  = ( $code ? "HTTP {$code} — " : '' ) . ( '' !== $text ? $text : $base );
 		return mb_substr( wp_strip_all_tags( $out ), 0, 160 );
 	}
