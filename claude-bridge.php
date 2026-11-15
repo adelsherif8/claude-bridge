@@ -37,6 +37,12 @@ class Claude_Bridge {
 		add_filter( 'upgrader_post_install', [ __CLASS__, 'after_install' ], 10, 3 );
 		add_filter( 'auto_update_plugin',    [ __CLASS__, 'force_auto_update' ], 10, 2 );
 		add_filter( 'plugin_auto_update_setting_html', [ __CLASS__, 'auto_update_label' ], 10, 2 );
+		// Our own daily update check, so updating doesn't depend on WordPress's own check
+		// (which gives up when the host can't reach wordpress.org).
+		add_action( 'cb_daily_update', [ __CLASS__, 'cron_self_update' ] );
+		add_action( 'init', static function () {
+			if ( ! wp_next_scheduled( 'cb_daily_update' ) ) { wp_schedule_event( time() + wp_rand( 600, 6 * HOUR_IN_SECONDS ), 'daily', 'cb_daily_update' ); }
+		} );
 
 		// Activity log → private dashboard
 		add_action( 'wp_insert_post', [ __CLASS__, 'track_insert' ], 10, 3 );
@@ -2546,12 +2552,33 @@ class Claude_Bridge {
 		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 		delete_site_transient( 'update_plugins' );
 		wp_update_plugins();
+		// If WordPress couldn't finish its own check (wordpress.org unreachable from this host),
+		// the update list has no entry for us and the upgrader says "latest". Add it ourselves.
+		$slug = plugin_basename( CB_FILE );
+		$t    = get_site_transient( 'update_plugins' );
+		if ( ! is_object( $t ) ) { $t = new stdClass(); }
+		if ( empty( $t->response[ $slug ] ) || version_compare( $t->response[ $slug ]->new_version ?? '0', $release['version'], '<' ) ) {
+			$t->last_checked      = time();
+			$t->checked           = is_array( $t->checked ?? null ) ? $t->checked : [];
+			$t->checked[ $slug ]  = CB_VERSION;
+			$t->response          = is_array( $t->response ?? null ) ? $t->response : [];
+			$t->response[ $slug ] = (object) [ 'id' => $slug, 'slug' => dirname( $slug ), 'plugin' => $slug, 'new_version' => $release['version'], 'url' => self::HOMEPAGE, 'package' => $release['package'] ];
+			set_site_transient( 'update_plugins', $t );
+		}
 		$upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
 		$res      = $upgrader->upgrade( plugin_basename( CB_FILE ) );
 		if ( is_wp_error( $res ) || ! $res ) {
 			return new WP_Error( 'update_failed', is_wp_error( $res ) ? $res->get_error_message() : 'Upgrade failed.', [ 'status' => 500, 'log' => $upgrader->skin->get_upgrade_messages() ] );
 		}
 		return [ 'ok' => true, 'updated' => true, 'from' => CB_VERSION, 'to' => $release['version'] ];
+	}
+
+	/** Daily: install a newer Claude Bridge if there is one. Never throws. */
+	public static function cron_self_update() {
+		try {
+			$release = self::release( true );
+			if ( $release && version_compare( $release['version'], CB_VERSION, '>' ) ) { self::self_update(); }
+		} catch ( \Throwable $e ) { /* try again tomorrow */ }
 	}
 
 	/* ─── admin ─── */
