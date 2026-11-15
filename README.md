@@ -15,6 +15,15 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.10.0
+- New `GET /plugins` and `POST /plugins/update`: update Adel's own plugins (Contact Form +
+  GoHighLevel, CFT Group Forms, AutoShippers Forms) to the version their own updater offers.
+  Matched by plugin name AND author; never accepts a URL or package.
+- Safety: skips a site that's already unhealthy; backs each plugin up as a zip in a locked
+  folder; after each update checks the home page actually renders (not just HTTP 200) and
+  automatically restores the previous version if it doesn't; stops if a site can't be
+  recovered. A plugin folder can never be left missing.
+
 ### 1.9.1
 - Analytics: a page tracked by URL in older events and by post ID in newer ones is now
   shown once, not twice (e.g. "/" and "Home").

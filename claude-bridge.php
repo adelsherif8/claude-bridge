@@ -406,6 +406,8 @@ class Claude_Bridge {
 		register_rest_route( CB_NS, '/guard',             [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_save' ] ] );
 		register_rest_route( CB_NS, '/guard/log',         [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'guard_log_list' ] ] );
 		register_rest_route( CB_NS, '/history/(?P<id>\d+)', [ 'methods' => 'GET', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'page_history' ] ] );
+		register_rest_route( CB_NS, '/plugins',          [ 'methods' => 'GET',  'permission_callback' => $a, 'callback' => [ __CLASS__, 'own_plugins' ] ] );
+		register_rest_route( CB_NS, '/plugins/update',   [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'update_own_plugins' ] ] );
 		register_rest_route( CB_NS, '/self-update',      [ 'methods' => 'POST', 'permission_callback' => $a, 'callback' => [ __CLASS__, 'self_update' ] ] );
 	}
 
@@ -1980,6 +1982,250 @@ class Claude_Bridge {
 		return $plugin_file === plugin_basename( CB_FILE ) ? esc_html( 'Auto-updates always on' ) : $html;
 	}
 
+	/* ─── own-plugin updates (allowlisted) ─── */
+
+	/**
+	 * The only plugins these endpoints will ever touch: Adel's own, matched by name AND author
+	 * so a renamed install folder still matches but no third-party plugin ever can.
+	 */
+	const OWN_PLUGINS = [ 'Contact Form + GoHighLevel', 'CFT Group Forms', 'AutoShippers Forms' ];
+	const OWN_AUTHOR  = 'Adel Emad';
+
+	private static function upgrade_includes() {
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		require_once ABSPATH . 'wp-admin/includes/misc.php';
+		require_once ABSPATH . 'wp-admin/includes/update.php';
+		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+	}
+
+	/** Installed allowlisted plugins → [ basename => header data ]. */
+	private static function find_own_plugins() {
+		self::upgrade_includes();
+		$found = [];
+		foreach ( get_plugins() as $basename => $data ) {
+			if ( in_array( $data['Name'] ?? '', self::OWN_PLUGINS, true ) && self::OWN_AUTHOR === wp_strip_all_tags( $data['Author'] ?? '' ) ) {
+				$found[ $basename ] = $data;
+			}
+		}
+		return $found;
+	}
+
+	/** Re-run every plugin's own updater so "update available" is current. */
+	private static function refresh_update_data() {
+		delete_site_transient( 'update_plugins' );
+		self::silently( static function () { wp_update_plugins(); } );
+		return get_site_transient( 'update_plugins' );
+	}
+
+	private static function own_plugin_rows( $updates ) {
+		$rows = [];
+		foreach ( self::find_own_plugins() as $basename => $data ) {
+			$offer  = $updates->response[ $basename ] ?? null;
+			$rows[] = [
+				'plugin'    => $basename,
+				'name'      => $data['Name'],
+				'version'   => $data['Version'],
+				'active'    => is_plugin_active( $basename ),
+				'available' => $offer && version_compare( $offer->new_version, $data['Version'], '>' ) ? $offer->new_version : null,
+			];
+		}
+		return $rows;
+	}
+
+	/**
+	 * Does the home page still render? A status code alone isn't enough: a broken plugin can
+	 * print an error with HTTP 200. Healthy = 2xx/3xx, a complete page, no WP critical error.
+	 */
+	private static function site_health() {
+		$r = wp_remote_get( add_query_arg( 'cb_health', time(), home_url( '/' ) ), [
+			'timeout' => 20, 'sslverify' => false, 'headers' => [ 'Cache-Control' => 'no-cache' ],
+		] );
+		if ( is_wp_error( $r ) ) { return [ 'healthy' => false, 'http' => 0, 'reason' => $r->get_error_message() ]; }
+		$code     = (int) wp_remote_retrieve_response_code( $r );
+		$body     = (string) wp_remote_retrieve_body( $r );
+		$critical = false !== stripos( $body, 'critical error' );
+		$complete = false !== stripos( $body, '</html>' );
+		$healthy  = $code >= 200 && $code < 400 && ! $critical && $complete;
+		$reason   = $healthy ? '' : ( $critical ? 'WordPress critical error' : ( $complete ? "HTTP {$code}" : 'page did not finish rendering' ) );
+		return [ 'healthy' => $healthy, 'http' => $code, 'reason' => $reason ];
+	}
+
+	/**
+	 * Backups live in their own folder, NOT wp-content/upgrade — WordPress empties that folder
+	 * before every install, which would destroy the backup mid-update. Stored as a zip so the
+	 * copy can't be executed from the web, with the folder locked down as well.
+	 */
+	private static function backup_folder() {
+		$dir = WP_CONTENT_DIR . '/cb-backups';
+		if ( ! is_dir( $dir ) ) {
+			wp_mkdir_p( $dir );
+			@file_put_contents( $dir . '/index.php', "<?php // Silence is golden.\n" ); // phpcs:ignore
+			@file_put_contents( $dir . '/.htaccess', "Require all denied\nDeny from all\n" ); // phpcs:ignore
+		}
+		return $dir;
+	}
+
+	private static function zip_folder( $src, $zip_path ) {
+		$base = dirname( $src );
+		if ( class_exists( 'ZipArchive' ) ) {
+			$zip = new ZipArchive();
+			if ( true !== $zip->open( $zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE ) ) { return false; }
+			$it = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $src, FilesystemIterator::SKIP_DOTS ), RecursiveIteratorIterator::SELF_FIRST );
+			$zip->addEmptyDir( basename( $src ) );
+			foreach ( $it as $f ) {
+				$rel = substr( $f->getPathname(), strlen( $base ) + 1 );
+				$f->isDir() ? $zip->addEmptyDir( $rel ) : $zip->addFile( $f->getPathname(), $rel );
+			}
+			return $zip->close() && filesize( $zip_path ) > 0;
+		}
+		require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+		$pz = new PclZip( $zip_path );
+		return 0 !== $pz->create( $src, PCLZIP_OPT_REMOVE_PATH, $base ) && filesize( $zip_path ) > 0;
+	}
+
+	/** Zip a plugin's folder aside so a bad update can be undone. Returns the zip path or null. */
+	private static function backup_plugin( $basename ) {
+		$folder = dirname( $basename );
+		if ( '.' === $folder || ! WP_Filesystem() ) { return null; }
+		$zip = self::backup_folder() . '/' . sanitize_file_name( $folder ) . '-' . time() . '.zip';
+		if ( ! self::zip_folder( WP_PLUGIN_DIR . '/' . $folder, $zip ) ) { @unlink( $zip ); return null; } // phpcs:ignore
+		return $zip;
+	}
+
+	/**
+	 * Put the backed-up version back. The broken copy is moved aside first and only deleted
+	 * once the old version is safely in place — if anything fails it goes back where it was,
+	 * so the plugin folder can never end up missing.
+	 */
+	private static function restore_plugin( $basename, $zip ) {
+		global $wp_filesystem;
+		if ( ! $zip || ! file_exists( $zip ) || ! WP_Filesystem() ) { return false; }
+		$dest  = WP_PLUGIN_DIR . '/' . dirname( $basename );
+		$aside = $dest . '.cb-broken-' . time();
+		if ( ! $wp_filesystem->move( $dest, $aside, true ) ) { return false; }
+
+		$ok = unzip_file( $zip, WP_PLUGIN_DIR );
+		if ( is_wp_error( $ok ) || ! file_exists( WP_PLUGIN_DIR . '/' . $basename ) ) {
+			$wp_filesystem->delete( $dest, true );
+			$wp_filesystem->move( $aside, $dest, true );
+			wp_clean_plugins_cache();
+			return false;
+		}
+		$wp_filesystem->delete( $aside, true );
+		@unlink( $zip ); // phpcs:ignore
+		wp_clean_plugins_cache();
+		return true;
+	}
+
+	/** GET /plugins?refresh=1 — your plugins on this site, with any update their updater offers. */
+	public static function own_plugins( WP_REST_Request $r ) {
+		self::upgrade_includes();
+		$updates = $r->get_param( 'refresh' ) ? self::refresh_update_data() : get_site_transient( 'update_plugins' );
+		return [ 'ok' => true, 'bridge' => CB_VERSION, 'plugins' => self::own_plugin_rows( $updates ?: new stdClass() ) ];
+	}
+
+	/**
+	 * POST /plugins/update — body: { plugins?: [basename,…], note? }
+	 * Updates allowlisted plugins to the version WordPress already has on offer from each
+	 * plugin's own updater — exactly what clicking "Update" in wp-admin does. Never accepts a
+	 * package or URL. Afterwards loads the home page to catch an update that breaks the site.
+	 */
+	public static function update_own_plugins( WP_REST_Request $r ) {
+		self::upgrade_includes();
+		$own     = self::find_own_plugins();
+		$wanted  = array_filter( (array) $r->get_param( 'plugins' ) );
+		$targets = $wanted ? array_intersect( array_keys( $own ), $wanted ) : array_keys( $own );
+		$updates = self::refresh_update_data();
+		$results = [];
+		$stop    = false;
+		if ( ! is_object( $updates ) ) { $updates = new stdClass(); }
+
+		$pending = array_filter( $targets, static function ( $b ) use ( $updates, $own ) {
+			$o = $updates->response[ $b ] ?? null;
+			return $o && version_compare( $o->new_version, $own[ $b ]['Version'], '>' );
+		} );
+		// If the site is already broken, an update would get the blame and might make it worse.
+		if ( $pending ) {
+			$pre = self::site_health();
+			if ( ! $pre['healthy'] ) {
+				return [ 'ok' => false, 'skipped' => true, 'reason' => 'Site was not healthy before updating (' . $pre['reason'] . ') — nothing was changed.', 'results' => [] ];
+			}
+		}
+
+		foreach ( $targets as $basename ) {
+			if ( $stop ) {
+				$results[] = [ 'plugin' => $basename, 'name' => $own[ $basename ]['Name'], 'status' => 'not_attempted', 'error' => 'Stopped: an earlier update left the site unhealthy.' ];
+				continue;
+			}
+			// Each upgrade clears WordPress's list of available updates; put ours back first.
+			set_site_transient( 'update_plugins', $updates );
+			$before = $own[ $basename ]['Version'];
+			$offer  = $updates->response[ $basename ] ?? null;
+			if ( ! $offer || ! version_compare( $offer->new_version, $before, '>' ) ) {
+				$results[] = [ 'plugin' => $basename, 'name' => $own[ $basename ]['Name'], 'status' => 'current', 'version' => $before ];
+				continue;
+			}
+			$was_active = is_plugin_active( $basename );
+			$backup     = self::backup_plugin( $basename );
+			$upgrader   = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
+			$res        = self::silently( static function () use ( $upgrader, $basename ) { return $upgrader->upgrade( $basename ); } );
+
+			wp_clean_plugins_cache();
+			$after = get_plugin_data( WP_PLUGIN_DIR . '/' . $basename, false, false )['Version'] ?? $before;
+			if ( $was_active && ! is_plugin_active( $basename ) ) {
+				self::silently( static function () use ( $basename ) { activate_plugin( $basename ); } );
+			}
+
+			$ok     = ! is_wp_error( $res ) && $res && version_compare( $after, $before, '>' );
+			$row    = [
+				'plugin' => $basename,
+				'name'   => $own[ $basename ]['Name'],
+				'status' => $ok ? 'updated' : 'failed',
+				'from'   => $before,
+				'to'     => $after,
+				'error'  => $ok ? null : ( is_wp_error( $res ) ? $res->get_error_message() : implode( ' ', array_map( 'wp_strip_all_tags', (array) $upgrader->skin->get_upgrade_messages() ) ) ),
+			];
+
+			// Check after each plugin so a breakage is pinned to the one that caused it, and undone.
+			if ( $ok ) {
+				$health = self::site_health();
+				if ( ! $health['healthy'] ) {
+					$restored = $backup && self::restore_plugin( $basename, $backup );
+					if ( $restored && $was_active && ! is_plugin_active( $basename ) ) {
+						self::silently( static function () use ( $basename ) { activate_plugin( $basename ); } );
+					}
+					$backup        = null;
+					$again         = self::site_health();
+					if ( ! $again['healthy'] ) { $stop = true; }
+					$row['status'] = $restored ? 'rolled_back' : 'broke_site';
+					$row['to']     = $restored ? $before : $after;
+					$row['error']  = 'Site broke after updating (' . $health['reason'] . ').' . ( $restored
+						? ' Restored ' . $before . ( $again['healthy'] ? ' — site is healthy again.' : ' — but the site is STILL not healthy: ' . $again['reason'] )
+						: ' Could not restore the previous version automatically — fix by hand.' );
+					if ( ! $restored ) { $stop = true; }
+				}
+			}
+			if ( $backup ) { @unlink( $backup ); } // phpcs:ignore
+			$row['active'] = is_plugin_active( $basename );
+			$results[]     = $row;
+		}
+
+		$changed = array_filter( $results, static function ( $x ) { return 'updated' === $x['status']; } );
+		$bad     = array_filter( $results, static function ( $x ) { return ! in_array( $x['status'], [ 'updated', 'current' ], true ); } );
+		$out     = [ 'ok' => ! $bad, 'results' => array_values( $results ) ];
+
+		if ( $changed ) {
+			$out['site_check'] = self::site_health();
+			$out['purged']     = self::auto_purge( $r, [], false );
+			$front = (int) get_option( 'page_on_front' );
+			if ( $front && get_post( $front ) ) {
+				self::queue( get_post( $front ), 'edited', array_merge( [ 'Plugins updated' ], array_map( static function ( $x ) { return "{$x['name']} {$x['from']} → {$x['to']}"; }, $changed ) ) );
+			}
+		}
+		return $out;
+	}
+
 	/** POST /self-update — install the latest release right now instead of waiting for WP cron. */
 	public static function self_update() {
 		$release = self::release( true );
@@ -2102,6 +2348,8 @@ class Claude_Bridge {
 		<tr><td><code>GET  /cftg/entries</code></td><td>since?, status?, form?, limit?, offset?</td><td>Read CFT Group Forms entries (read-only)</td></tr>
 		<tr><td><code>POST /purge</code></td><td>ids?, urls?, all?, verify?</td><td>Clear every cache this site has, then report what the server returns</td></tr>
 		<tr><td><code>POST /cache/flush</code></td><td>—</td><td>Flush RankMath sitemap, SiteGround, Elementor CSS caches</td></tr>
+		<tr><td><code>GET  /plugins</code></td><td>refresh?</td><td>Your plugins on this site (Contact Form + GHL, CFT Group Forms, AutoShippers Forms) and any update offered</td></tr>
+		<tr><td><code>POST /plugins/update</code></td><td>plugins? (basenames)</td><td>Update your plugins to the version their own updater offers — never a URL or package</td></tr>
 		<tr><td><code>POST /self-update</code></td><td>—</td><td>Install the latest plugin version immediately</td></tr>
 		</tbody>
 		</table>
