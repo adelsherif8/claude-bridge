@@ -1238,6 +1238,7 @@ class Claude_Bridge {
 			if ( ! self::table_exists( $t ) ) { continue; }
 			$jc = self::column_exists( $t, $cfg['json'] ) ? $cfg['json'] : null;
 			$fc = self::column_exists( $t, $cfg['eform'] ) ? $cfg['eform'] : null;
+			$mc = self::column_exists( $t, 'ghl_message' );
 
 			$where = [ 'created_at >= %s' ]; $args = [ $since ];
 			if ( '' !== $q ) {
@@ -1255,11 +1256,12 @@ class Claude_Bridge {
 				foreach ( (array) $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT `{$fc}` FROM `{$t}` WHERE created_at >= %s", $since ) ) as $f ) { if ( '' !== $f ) { $forms[] = $f; } } // phpcs:ignore WordPress.DB
 			}
 
-			$cols = 'id, created_at, first_name, last_name, email, phone, ghl_status' . ( $fc ? ", `{$fc}` AS form" : '' ) . ( $jc ? ", `{$jc}` AS j" : '' );
+			$cols = 'id, created_at, first_name, last_name, email, phone, ghl_status' . ( $fc ? ", `{$fc}` AS form" : '' ) . ( $jc ? ", `{$jc}` AS j" : '' ) . ( $mc ? ', ghl_message' : '' );
 			$res  = $wpdb->get_results( $wpdb->prepare( "SELECT {$cols} FROM `{$t}` WHERE {$clause} ORDER BY created_at DESC, id DESC LIMIT %d", array_merge( $args, [ $per * $page ] ) ), ARRAY_A ); // phpcs:ignore WordPress.DB
 			foreach ( (array) $res as $row ) {
 				$j  = $jc ? self::entry_json( $row['j'] ) : [];
 				$st = strtolower( (string) $row['ghl_status'] );
+				$isf = in_array( $st, $failed, true );
 				$rows[] = [
 					'id'       => $key . '-' . $row['id'],
 					'date'     => $row['created_at'],
@@ -1271,12 +1273,37 @@ class Claude_Bridge {
 					'source'   => self::lead_source( $j ),
 					'campaign' => mb_substr( (string) ( $j['utm_campaign'] ?? '' ), 0, 80 ),
 					'page'     => esc_url_raw( (string) ( $j['page_url'] ?? $j['landing'] ?? '' ) ),
+					'reason'   => $isf ? self::fail_reason( $j, (string) ( $row['ghl_message'] ?? '' ) ) : '',
 				];
 			}
 		}
 		usort( $rows, static function ( $a, $b ) { return strcmp( $b['date'], $a['date'] ) ?: strcmp( $b['id'], $a['id'] ); } );
 		return [ 'ok' => true, 'total' => $total, 'page' => $page, 'per_page' => $per, 'forms' => array_values( array_unique( $forms ) ),
 			'rows' => array_slice( $rows, ( $page - 1 ) * $per, $per ) ];
+	}
+
+	/**
+	 * Short, human-readable reason a lead didn't reach GoHighLevel. Built from the HTTP code
+	 * and the message GHL sent back — never the raw payload.
+	 */
+	private static function fail_reason( array $j, string $msg ) {
+		$has  = isset( $j['_ghl_http_code'] ) || isset( $j['_ghl_http'] );
+		$code = (int) ( $j['_ghl_http_code'] ?? $j['_ghl_http'] ?? 0 );
+		$resp = $j['_ghl_response'] ?? '';
+		$r    = is_array( $resp ) ? $resp : json_decode( (string) $resp, true );
+		$text = trim( $msg );
+		if ( '' === $text && is_array( $r ) ) {
+			$m    = $r['message'] ?? $r['msg'] ?? $r['error'] ?? '';
+			$text = is_array( $m ) ? implode( '; ', array_map( 'strval', array_filter( $m, 'is_scalar' ) ) ) : (string) $m;
+		}
+		if ( '' === $text && ! is_array( $r ) && is_string( $resp ) && '' !== trim( $resp ) && strlen( $resp ) < 200 && false === strpos( $resp, '<' ) ) {
+			$text = trim( $resp );
+		}
+		$hint = [ 0 => 'No response from GoHighLevel (timeout or connection error)', 400 => 'GoHighLevel rejected the data', 401 => 'GoHighLevel key is invalid or expired',
+			403 => 'GoHighLevel key lacks permission', 404 => 'GoHighLevel location or field not found', 422 => 'GoHighLevel rejected a field value', 429 => 'GoHighLevel rate limit hit' ];
+		$base = ! $has ? 'Not accepted by GoHighLevel (no details were saved for this lead)' : $hint[ $code ] ?? ( $code >= 500 ? 'GoHighLevel server error' : 'Not accepted by GoHighLevel' );
+		$out  = ( $code ? "HTTP {$code} — " : '' ) . ( '' !== $text ? $text : $base );
+		return mb_substr( wp_strip_all_tags( $out ), 0, 160 );
 	}
 
 	/* ─── CFT Group Forms (read-only) ─── */
