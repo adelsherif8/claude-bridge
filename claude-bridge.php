@@ -1452,7 +1452,7 @@ class Claude_Bridge {
 
 	/** Rows of { created_at, form, j (tracking array) } → counts. */
 	private static function breakdown_rows( array $rows ) {
-		$out = [ 'by_source' => [], 'by_campaign' => [], 'by_form' => [], 'by_weekday' => array_fill( 0, 7, 0 ), 'by_hour' => array_fill( 0, 24, 0 ) ];
+		$out = [ 'by_source' => [], 'by_campaign' => [], 'by_form' => [], 'by_form_source' => [], 'by_weekday' => array_fill( 0, 7, 0 ), 'by_hour' => array_fill( 0, 24, 0 ) ];
 		foreach ( (array) $rows as $row ) {
 			$j   = is_array( $row['j'] ?? null ) ? $row['j'] : [];
 			$src = self::lead_source( $j );
@@ -1460,7 +1460,11 @@ class Claude_Bridge {
 			$camp = trim( (string) ( $j['utm_campaign'] ?? '' ) );
 			if ( '' !== $camp ) { $camp = mb_substr( $camp, 0, 80 ); $out['by_campaign'][ $camp ] = ( $out['by_campaign'][ $camp ] ?? 0 ) + 1; }
 			$form = trim( (string) ( $row['form'] ?? '' ) );
-			if ( '' !== $form ) { $out['by_form'][ $form ] = ( $out['by_form'][ $form ] ?? 0 ) + 1; }
+			if ( '' !== $form ) {
+				$out['by_form'][ $form ] = ( $out['by_form'][ $form ] ?? 0 ) + 1;
+				// Where each form's leads came from — lets the dashboard explain views it can't tie to a page.
+				$out['by_form_source'][ $form ][ $src ] = ( $out['by_form_source'][ $form ][ $src ] ?? 0 ) + 1;
+			}
 			$ts = strtotime( $row['created_at'] );
 			if ( $ts ) { $out['by_weekday'][ (int) gmdate( 'w', $ts ) ]++; $out['by_hour'][ (int) gmdate( 'G', $ts ) ]++; }
 		}
@@ -2693,12 +2697,47 @@ class Claude_Bridge {
 	}
 
 	/** POST /self-update — install the latest release right now instead of waiting for WP cron. */
+	/**
+	 * Update Claude Bridge itself — safely. One update at a time (the daily check and a manual
+	 * update must never race on the same folder), a zip backup first, and a check afterwards:
+	 * if the plugin file is missing once WordPress says it's done, the backup goes straight back.
+	 */
 	public static function self_update() {
 		$release = self::release( true );
 		if ( ! $release ) { return new WP_Error( 'no_release', 'Update server unreachable.', [ 'status' => 502 ] ); }
 		if ( ! version_compare( $release['version'], CB_VERSION, '>' ) ) {
 			return [ 'ok' => true, 'updated' => false, 'version' => CB_VERSION ];
 		}
+		if ( get_transient( 'cb_self_update_lock' ) ) {
+			return new WP_Error( 'busy', 'An update is already running on this site — try again in a few minutes.', [ 'status' => 409 ] );
+		}
+		set_transient( 'cb_self_update_lock', time(), 10 * MINUTE_IN_SECONDS );
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		$slug = plugin_basename( CB_FILE );
+		$zip  = self::backup_plugin( $slug );
+		try {
+			$res = self::self_update_run( $release );
+		} catch ( \Throwable $e ) {
+			$res = new WP_Error( 'update_failed', 'Update crashed: ' . substr( $e->getMessage(), 0, 200 ), [ 'status' => 500 ] );
+		}
+		wp_clean_plugins_cache( true );
+		$there = file_exists( WP_PLUGIN_DIR . '/' . $slug ) ? $slug : ( file_exists( WP_PLUGIN_DIR . '/claude-bridge/claude-bridge.php' ) ? 'claude-bridge/claude-bridge.php' : '' );
+		if ( ! $there && $zip && file_exists( $zip ) ) {
+			// The folder is gone even though the upgrader may have said "success": put the old version back.
+			if ( WP_Filesystem() ) { unzip_file( $zip, WP_PLUGIN_DIR ); }
+			wp_clean_plugins_cache( true );
+			if ( file_exists( WP_PLUGIN_DIR . '/' . $slug ) ) { activate_plugin( $slug ); $there = $slug; }
+			$res = new WP_Error( 'update_failed', 'The update removed the plugin folder; the previous version was restored.', [ 'status' => 500, 'restored' => (bool) $there ] );
+		} elseif ( $there && ! is_plugin_active( $there ) ) {
+			activate_plugin( $there );
+		}
+		if ( ! is_wp_error( $res ) && $zip ) { @unlink( $zip ); } // phpcs:ignore -- keep the backup only when something went wrong
+		delete_transient( 'cb_self_update_lock' );
+		return $res;
+	}
+
+	private static function self_update_run( array $release ) {
 		require_once ABSPATH . 'wp-admin/includes/file.php';
 		require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		require_once ABSPATH . 'wp-admin/includes/misc.php';

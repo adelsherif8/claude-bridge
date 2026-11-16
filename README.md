@@ -19,6 +19,11 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 - Plugin updates (`/plugins`, `/plugins/update`) first ask every GitHub-based update checker
   (Plugin Update Checker) on the site to look again, so a release that came out minutes ago
   installs straight away instead of after its 12-hour check.
+- Safer self-update: one at a time (the daily check and a manual update can't race), a zip
+  backup first, and if the plugin folder is missing afterwards — even when WordPress reported
+  success — the previous version is restored and re-activated automatically.
+- Lead breakdowns include `by_form_source` (where each form's leads came from), so the dashboard
+  can explain form views that aren't tied to a page.
 
 ### 1.12.1
 - `POST /plugin-settings` accepts a flat list of numbers for settings the plugin stores as lists
