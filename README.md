@@ -15,6 +15,11 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.12.1
+- `POST /plugin-settings` accepts a flat list of numbers for settings the plugin stores as lists
+  (e.g. the dental plugin's `imp_landing_pages` / `alg_landing_pages` page IDs), so landing-page
+  tracking can be switched on remotely. Text settings still take text only.
+
 ### 1.12.0
 - Lead quality, worked out on the site across every form: each `/entries` row has `dupes`
   (how many times the same email or phone sent something in the period), `repeat` (an earlier

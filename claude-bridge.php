@@ -1779,16 +1779,25 @@ class Claude_Bridge {
 			return new WP_Error( 'unknown_keys', 'Unknown setting key(s): ' . implode( ', ', $unknown ), [ 'status' => 400, 'unknown' => $unknown ] );
 		}
 
-		// Scalars only. JSON-bearing settings (imp_single_qs and friends) are strings and pass through as-is.
+		// Scalars, except settings that are lists in the plugin (e.g. imp_landing_pages: page IDs),
+		// which take a flat list of numbers. JSON-bearing settings are strings and pass through as-is.
+		$fn       = self::PLUGIN_OPTION_DEFAULTS[ $option ] ?? '';
+		$defaults = ( $fn && function_exists( $fn ) ) ? (array) $fn() : [];
 		$bad = [];
 		foreach ( $set as $k => $v ) {
-			if ( ! is_scalar( $v ) && null !== $v ) { $bad[] = $k; }
+			$is_list = is_array( $defaults[ $k ] ?? null ) || is_array( $stored[ $k ] ?? null );
+			if ( is_array( $v ) ) {
+				$ok = $is_list && count( $v ) <= 200 && $v === array_values( $v ) && ! array_filter( $v, static function ( $x ) { return ! is_int( $x ) && ! ( is_string( $x ) && ctype_digit( $x ) ); } );
+				if ( ! $ok ) { $bad[] = $k; }
+			} elseif ( ! is_scalar( $v ) && null !== $v ) {
+				$bad[] = $k;
+			}
 		}
 		if ( $bad ) {
-			return new WP_Error( 'bad_values', 'Values must be strings or numbers: ' . implode( ', ', $bad ), [ 'status' => 400 ] );
+			return new WP_Error( 'bad_values', 'Values must be strings or numbers (lists of numbers only for list settings): ' . implode( ', ', $bad ), [ 'status' => 400 ] );
 		}
 
-		$set    = array_map( static function ( $v ) { return is_string( $v ) ? $v : ( is_bool( $v ) ? ( $v ? '1' : '0' ) : $v ); }, $set );
+		$set    = array_map( static function ( $v ) { return is_array( $v ) ? array_values( array_map( 'intval', $v ) ) : ( is_string( $v ) ? $v : ( is_bool( $v ) ? ( $v ? '1' : '0' ) : $v ) ); }, $set );
 		$merged = array_merge( $stored, $set );
 
 		self::push_backup( $option, $stored );
