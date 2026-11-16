@@ -2465,9 +2465,23 @@ class Claude_Bridge {
 
 	/** Re-run every plugin's own updater so "update available" is current. */
 	private static function refresh_update_data() {
+		self::force_update_checkers();
 		delete_site_transient( 'update_plugins' );
 		self::silently( static function () { wp_update_plugins(); } );
 		return get_site_transient( 'update_plugins' );
+	}
+
+	/**
+	 * Plugins that update from GitHub use "Plugin Update Checker", which only asks GitHub every
+	 * 12 hours and remembers the answer — so a new release stays invisible until then. Ask every
+	 * such checker on the site to look again now. Read-only: it only fetches release info.
+	 */
+	private static function force_update_checkers() {
+		foreach ( array_keys( $GLOBALS ) as $name ) {
+			$v = $GLOBALS[ $name ] ?? null;
+			if ( ! is_object( $v ) || false === stripos( get_class( $v ), 'PluginUpdateChecker' ) || ! method_exists( $v, 'checkForUpdates' ) ) { continue; }
+			try { self::silently( static function () use ( $v ) { $v->checkForUpdates(); } ); } catch ( \Throwable $e ) { /* one checker failing must not stop the rest */ }
+		}
 	}
 
 	private static function own_plugin_rows( $updates ) {

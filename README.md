@@ -15,6 +15,11 @@ REST API bridge for Claude Code on WordPress sites with no SSH access.
 
 ## Changelog
 
+### 1.12.2
+- Plugin updates (`/plugins`, `/plugins/update`) first ask every GitHub-based update checker
+  (Plugin Update Checker) on the site to look again, so a release that came out minutes ago
+  installs straight away instead of after its 12-hour check.
+
 ### 1.12.1
 - `POST /plugin-settings` accepts a flat list of numbers for settings the plugin stores as lists
   (e.g. the dental plugin's `imp_landing_pages` / `alg_landing_pages` page IDs), so landing-page
